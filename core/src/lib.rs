@@ -8,6 +8,7 @@ pub mod cpu;
 pub mod cycler;
 pub mod engine;
 pub mod errlog;
+pub mod eta;
 pub mod fft;
 pub mod font;
 pub mod hash;

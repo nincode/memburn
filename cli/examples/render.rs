@@ -85,6 +85,8 @@ fn mem_test(test: TestId, index: u32, step: u32, steps: u32, pct: u64) -> Curren
         done: total * pct / 100,
         total,
         left_ms: Some(31_000),
+        job_left_ms: Some(152_000),
+        job_label: "job",
     }
 }
 
@@ -246,6 +248,37 @@ pub fn scenes() -> Vec<(&'static str, usize, usize, View)> {
     v.qr_zoom = true;
     v.keys = vec![("Q", "back"), ("Esc", "stop")];
     out.push(("7-qr-zoom", 100, 31, v));
+
+    let four: Vec<Dimm> = ["A1", "A2", "B1", "B2"]
+        .map(|slot| Dimm {
+            locator: format!("DIMM_{slot}"),
+            bank: format!("BANK {}", &slot[1..]),
+            size_mib: 16384,
+            speed: 3600,
+            configured: 3200,
+            part: "F4-3600C16-16GTZNC".into(),
+            ..Dimm::default()
+        })
+        .to_vec();
+    for (name, w, h, dimms) in [
+        ("8-modules-2-80x25", 80, 25, None),
+        ("8-modules-4-80x25", 80, 25, Some(four.clone())),
+        ("8-modules-2-160x50", 160, 50, None),
+        ("8-modules-4-160x50", 160, 50, Some(four.clone())),
+    ] {
+        let mut v = base(
+            Verdict::Running,
+            quick_plan([Done { ms: 4000, errors: 0 }, Running, Pending, Pending]),
+            mem_test(TestId::MovingInvWalk8, 2, 9, 24, 37),
+        );
+        v.elapsed_ms = 19_000;
+        v.perf.mem = mem_series(120);
+        v.perf.temp_c = Some(61);
+        if let Some(d) = dimms {
+            v.dimms = d;
+        }
+        out.push((name, w, h, v));
+    }
     out
 }
 

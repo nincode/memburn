@@ -170,7 +170,11 @@ pub enum Current {
         steps: u32,
         done: u64,
         total: u64,
+        /// This test's time left; None while estimating.
         left_ms: Option<u64>,
+        /// The job's time left, or the cycle's when `job_label` is "cycle"; None while estimating.
+        job_left_ms: Option<u64>,
+        job_label: &'static str,
     },
     /// Bit-fade wait: memory is left idle.
     Hold { left_ms: u64 },
@@ -434,7 +438,11 @@ pub fn render(v: &View, f: &mut Frame) {
     current(v, f, Rect { x: 0, y: body.y, w: lw, h: top_h });
     plan(v, f, Rect { x: 0, y: body.y + top_h, w: lw, h: bot_h });
     perf(v, f, Rect { x: lw, y: body.y, w: rw, h: top_h });
-    errors(v, f, Rect { x: lw, y: body.y + top_h, w: rw, h: bot_h });
+    let mod_h = modules_height(v.dimms.len(), bot_h);
+    errors(v, f, Rect { x: lw, y: body.y + top_h, w: rw, h: bot_h - mod_h });
+    if mod_h > 0 {
+        modules(v, f, Rect { x: lw, y: body.y + top_h + bot_h - mod_h, w: rw, h: mod_h });
+    }
     if qw > 0 {
         remote(v, f, Rect { x: lw + rw, y: body.y, w: qw, h: body.h });
     }
@@ -551,15 +559,27 @@ fn current(v: &View, f: &mut Frame, r: Rect) {
                 f.text(i.x + 16, line(n), value, i.w.saturating_sub(16), White, Black);
             }
         }
-        Current::Mem { test, pass, passes, index, count, step, steps, done, total, left_ms } => {
+        Current::Mem {
+            test,
+            pass,
+            passes,
+            index,
+            count,
+            step,
+            steps,
+            done,
+            total,
+            left_ms,
+            job_left_ms,
+            job_label,
+        } => {
             f.text(i.x, line(0), test.name(), i.w, White, Black);
             let pos = format!("pass {pass}/{passes}  ·  test {index}/{count}  ·  step {step}/{steps}");
             f.text(i.x, line(1), &pos, i.w, LightGray, Black);
             let pct = (done * 100).checked_div(*total).unwrap_or(0);
             bar(f, i.x, line(2), i.w, pct as usize, LightCyan);
             f.text(i.x, line(3), &format!("{} / {}", gib(*done), gib(*total)), i.w, LightGray, Black);
-            let left = left_ms.map_or(String::from("estimating"), |ms| format!("~{} left", clock(ms)));
-            f.text(i.x, line(4), &left, i.w, LightGray, Black);
+            f.text(i.x, line(4), &time_left(*left_ms, *job_left_ms, job_label), i.w, LightGray, Black);
         }
         Current::Hold { left_ms } => {
             f.text(i.x, line(0), TestId::BitFade.name(), i.w, White, Black);
@@ -591,6 +611,15 @@ fn current(v: &View, f: &mut Frame, r: Rect) {
                 f.text(i.x, line(5), &format!("{} FFTs checked", group(*ffts)), i.w, LightGray, Black);
             }
         }
+    }
+}
+
+/// "test ~0:00:31  ·  job ~0:03:40", or "time left: estimating".
+pub fn time_left(test: Option<u64>, job: Option<u64>, job_label: &str) -> String {
+    match (test, job) {
+        (Some(t), Some(j)) => format!("test ~{}  ·  {job_label} ~{}", clock(t), clock(j)),
+        (Some(t), None) => format!("test ~{}", clock(t)),
+        _ => String::from("time left: estimating"),
     }
 }
 
@@ -764,6 +793,58 @@ fn errors(v: &View, f: &mut Frame, r: Rect) {
     }
 }
 
+/// Rows the errors panel keeps below the modules panel.
+const ERRORS_MIN_H: usize = 5;
+
+/// Height of the modules panel under the errors panel in a column `h` rows high; 0 when it does not fit.
+fn modules_height(n: usize, h: usize) -> usize {
+    let rows = n.min(h.saturating_sub(ERRORS_MIN_H + 2));
+    if rows == 0 { 0 } else { rows + 2 }
+}
+
+/// Short slot name: the locator when it tells the modules apart, else the bank, else both.
+fn slot(d: &Dimm, all: &[Dimm]) -> String {
+    let unique = |f: fn(&Dimm) -> &str| !f(d).is_empty() && all.iter().filter(|o| f(o) == f(d)).count() == 1;
+    if unique(|d| &d.locator) {
+        d.locator.clone()
+    } else if unique(|d| &d.bank) {
+        d.bank.clone()
+    } else {
+        format!("{} {}", d.bank, d.locator).trim().into()
+    }
+}
+
+/// One line per module: slot, size, speed, part; the last row counts the ones that do not fit.
+fn modules(v: &View, f: &mut Frame, r: Rect) {
+    let i = f.panel(r, "Memory modules", None);
+    let slots: Vec<String> = v.dimms.iter().map(|d| slot(d, &v.dimms)).collect();
+    let sw = slots.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let more = v.dimms.len().saturating_sub(i.h);
+    let shown = if more > 0 { i.h.saturating_sub(1) } else { i.h };
+    for (n, (d, s)) in v.dimms.iter().zip(&slots).take(shown).enumerate() {
+        let speed = match (d.speed, d.configured) {
+            (0, 0) => String::new(),
+            (s, 0) => format!("{s} MT/s"),
+            (_, c) => format!("{c} MT/s"),
+        };
+        let size = crate::smbios::size(d.size_mib);
+        let x = f.text(i.x, i.y + n, &format!("{s:<sw$}"), i.w, White, Black);
+        let x = f.text(
+            x + 2,
+            i.y + n,
+            &format!("{size:>7}  {speed:>9}"),
+            (i.x + i.w).saturating_sub(x + 2),
+            LightGray,
+            Black,
+        );
+        f.text(x + 2, i.y + n, &d.part, (i.x + i.w).saturating_sub(x + 2), DarkGray, Black);
+    }
+    if more > 0 {
+        let s = format!("+ {} more", v.dimms.len() - shown);
+        f.text(i.x, i.y + shown, &s, i.w, DarkGray, Black);
+    }
+}
+
 /// Bits that flipped at least 3 times, always in the same direction: "stuck at 1: bit 17".
 fn stuck_bits(bits: &[BitStat]) -> Option<String> {
     let at = |one: bool| -> Vec<String> {
@@ -928,6 +1009,8 @@ mod tests {
                 done: 5 << 30,
                 total: 8 << 30,
                 left_ms: Some(9000),
+                job_left_ms: Some(130_000),
+                job_label: "job",
             },
             perf: Perf { mem: vec![20_000, 22_000, 25_000], temp_c: Some(64), ..Perf::default() },
             mem_errors: 4,
@@ -1027,6 +1110,38 @@ mod tests {
         v.perf.ram_temp_c = Some(47);
         render(&v, &mut f);
         assert!(has(&f));
+    }
+
+    #[test]
+    fn modules_panel_fits_without_overlap() {
+        let dimm = |k: usize| Dimm {
+            locator: format!("DIMM_{}{}", ["A", "B"][k % 2], 1 + k / 2),
+            size_mib: 16384,
+            speed: 3200,
+            part: "F4-3200C16-16GVK".into(),
+            ..Dimm::default()
+        };
+        for n in [2, 4, 8] {
+            for (w, h) in [(80, 25), (160, 50), (100, 31)] {
+                let mut v = sample();
+                v.dimms = (0..n).map(dimm).collect();
+                let mut f = Frame::new(w, h);
+                render(&v, &mut f);
+                let rows: Vec<String> = (0..h).map(|y| (0..w).map(|x| f.get(x, y).ch).collect()).collect();
+                let title = rows.iter().position(|r| r.contains(" Memory modules ")).expect("panel");
+                assert!(rows.iter().any(|r| r.contains(" Errors ")), "{rows:#?}");
+                let errors = rows.iter().position(|r| r.contains(" Errors ")).unwrap();
+                assert!(title >= errors + ERRORS_MIN_H, "{w}x{h} {n}: {rows:#?}");
+                assert!(rows[title + 1].contains("DIMM_A1") && rows[title + 1].contains("16 GiB"), "{rows:#?}");
+                assert!(rows[h - 2].matches('└').count() >= 2, "{rows:#?}");
+            }
+        }
+        assert_eq!(modules_height(4, 13), 6);
+        assert_eq!(modules_height(8, 13), 8);
+        assert_eq!(modules_height(2, 6), 0);
+        let same = |b: &str| Dimm { locator: "DIMM 0".into(), bank: b.into(), ..Dimm::default() };
+        let all = [same("P0 CHANNEL A"), same("P0 CHANNEL B")];
+        assert_eq!(slot(&all[1], &all), "P0 CHANNEL B");
     }
 
     #[test]

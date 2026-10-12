@@ -1,11 +1,9 @@
 [package]
 name = "memburn-init"
-version.workspace = true
+# Fixed, so the binary changes only with its code: an update re-execs memburn when init's hash is the same.
+version = "1.0.0"
 license.workspace = true
 edition.workspace = true
-
-[dependencies]
-memburn-core = { path = "../core" }
 
 [target."cfg(target_os = \"linux\")".dependencies]
 libc = "0.2.190"

@@ -50,7 +50,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-5-1` for 0.5.1 |
+| Volume label | `MB 0-6-0` for 0.6.0 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |
@@ -59,19 +59,22 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 
 ### Updates
 
-With a network the stick's Linux entry asks the live-view server for the latest release at start
-(3 s per try, retried for 10 s; no answer, no update). A newer release whose manifest carries a valid
-signature of the release key adds a row `U  Update to <version>` to the menu and the result screen.
-`update=auto` in `memburn.cfg` installs it before an unattended run.
+The stick's Linux entry asks the live-view server for the latest release from a background thread
+(nice 19, idle I/O) once a default route exists, retrying every 2 s doubling to 60 s for as long as memburn
+runs. A newer release whose manifest carries a valid signature of the release key is downloaded and staged
+right away; U on the menu, the run or the result screen (or `update=auto`) opts in. `update=off` sends no check.
 
 | | |
 |---|---|
 | Manifest | version, the stick's files as one tar (URL, size, SHA-256), and each file's path, size and SHA-256; signed with Ed25519, public key in `proto/src/release.rs` |
-| Install | downloads the tar, checks its hash and every file's, writes each file as `<file>.new` beside the old one with fsync, renames them into place with `grub.cfg` last, syncs and restarts |
-| Layout | `EFI/memburn/<version>/` holds each version's `vmlinuz`, `initrd.img` and `memburn.efi`; GRUB boots the new version by default and keeps `memburn <old> (previous)` entries; older versions are deleted |
+| Stage | streams the tar, writes each changed file as `<file>.new` beside the old one with fsync, and checks every file's hash and the tar's; any error removes the `.new` files |
+| Install | renames the `.new` files into place with `grub.cfg` last and syncs: without opt-in when the run ends (used at the next boot), with opt-in at once, stopping a run |
+| Start | with opt-in: when the release's `vmlinuz` and `memburn-init` hash the same as the booted kernel and `/init`, memburn copies the new `memburn` to `/memburn-next` and exits 12, and init runs it with the same arguments plus `--updated-from` and `--job`; otherwise exit 10 reboots |
+| Layout | `EFI/memburn/<version>/` holds each version's `vmlinuz`, `initrd.img`, `memburn`, `memburn-init` and `memburn.efi`; GRUB boots the new version by default and keeps `memburn <old> (previous)` entries; older versions are deleted |
 | Never written | `memburn.cfg`, `memburn.log`, `memburn-history.txt`, `memburn-crash-*.txt` |
 | Refused | a bad signature, a version not newer than the running one and the stick's, a hash mismatch, a short download; the stick stays unchanged |
 | Too little space | the row reads `Update <version>  re-flash needed` and offers no key |
+| Init | `memburn-init` has its own fixed version and no workspace dependency, so its binary changes only with its code |
 
 ## CLI options
 
@@ -86,17 +89,28 @@ signature of the release key adds a row `U  Update to <version>` to the menu and
 | `--no-upload`, `--server URL` | live view off, or another server |
 | `--log FILE` | append the run log |
 
-Exit codes: 0 pass, 1 errors found, 2 usage, 3 stopped early; on the stick 10 restart, 11 power off.
+Exit codes: 0 pass, 1 errors found, 2 usage, 3 stopped early; on the stick 10 restart, 11 power off, 12 start the updated memburn.
 Under Linux the test memory asks for huge pages; the log says how much got them. If it cannot be
 locked, it shrinks in 256 MiB steps down to 95% of available RAM. Locking test memory needs
 administrator rights (Linux: `ulimit -l`); without it the header shows "memory not locked".
+
+## Time left
+
+Memory test time scales with bus traffic, not sweeps: `TestId::traffic` weighs each phase (a write
+counts 2, a read 1, a copy 1.5), and every test costs about the same per traffic unit (0.86–0.91 s per
+30 GiB on a 5950X). `core::eta` divides the traffic still to move (this test; the job's passes, later
+cycles when finite, plus burn-in and bit-fade holds) by the measured rate: the average for the first
+10 s, then an exponential average over about 10 s. It shows "estimating" for the first 3 s, and the
+shown time counts down by itself until a new estimate differs by more than 5 % or 5 s. The menu's
+estimates use 29 ms per GiB of traffic.
 
 ## Coverage
 
 Coverage is the share of System RAM that a run tested, by physical address: the test buffer's pages
 (Linux as root, from `/proc/self/pagemap`) plus the kernel's early test, or the claimed pages on
 bare-metal UEFI. The stick's Linux entry boots with `memtest=2`, so the kernel tests its free memory
-with two patterns before anything else runs; `early_memtest=N` in `memburn.cfg` changes the count
+with two patterns before anything else runs, about 3 s per pattern per 16 GiB, while GRUB's
+"Kernel memory test" line stays on screen; `early_memtest=N` in `memburn.cfg` changes the count
 (0 turns it off). Its result is the "Kernel early test" row, and bad ranges it finds count as memory
 errors. Bare-metal UEFI moves the 64 MiB it leaves the firmware to tested memory after the main tests
 and tests that too. The summary adds the union over the last 10 runs on the same machine and RAM size,

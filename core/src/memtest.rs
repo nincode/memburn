@@ -139,9 +139,6 @@ pub const STRESS: [TestId; 8] = [
 pub const QUICK: [(TestId, u32); 4] =
     [(TestId::AddressMove, 1), (TestId::MovingInvWalk8, 1), (TestId::RandomSeq, 5), (TestId::Hashed, 1)];
 
-/// Rough time of one sweep over 1 GiB, ms.
-pub const SWEEP_MS_PER_GIB: u64 = 55;
-
 /// Pass value for round `round` of a repeated test: new seeds, same reported pass (errors keep the low 32 bits).
 pub fn round_pass(pass: u64, round: u32) -> u64 {
     pass | (round as u64) << 32

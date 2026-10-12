@@ -8,8 +8,10 @@ RUN rustup target add x86_64-unknown-linux-musl x86_64-unknown-uefi x86_64-pc-wi
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+# The target cache is shared across trees whose mtimes come from git; fresh mtimes force workspace crates to rebuild.
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
-    cargo build --release --locked --target x86_64-unknown-linux-musl -p memburn -p memburn-init \
+    find . -path ./target -prune -o -type f \( -name '*.rs' -o -name Cargo.toml -o -name '*.html' -o -name '*.png' -o -name '*.svg' \) -exec touch {} + \
+ && cargo build --release --locked --target x86_64-unknown-linux-musl -p memburn -p memburn-init \
  && cargo build --release --locked --target x86_64-unknown-uefi -p memburn-uefi \
  && cargo build --release --locked --target x86_64-pc-windows-gnu -p memburn \
  && mkdir /bin-out \

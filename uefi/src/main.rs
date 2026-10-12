@@ -23,6 +23,7 @@ use memburn_core::cpu::{self, Isa};
 use memburn_core::cycler;
 use memburn_core::engine::{Chunk, Moved, PhaseJob, chunk_bytes, chunk_regions};
 use memburn_core::errlog::{self, BitList, ErrorLog, MemError};
+use memburn_core::eta::{self, Rate, Shown};
 use memburn_core::fft::{BurnError, BurnStats, Burner, Fault, MAX_ERR, Plan};
 use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
@@ -148,6 +149,10 @@ struct Ui {
     covered: Ranges,
     /// Processor numbers and row labels in core cycler order.
     cores: Vec<(usize, String)>,
+    /// Memory traffic rate and the shown times left of the test and the job.
+    rate: Rate,
+    test_left: Shown,
+    job_left: Shown,
 }
 
 impl Ui {
@@ -320,6 +325,9 @@ fn main() -> Status {
         sensor: thermal::Sensor::find(),
         peak_temp: None,
         covered: Ranges::default(),
+        rate: Rate::default(),
+        test_left: Shown::default(),
+        job_left: Shown::default(),
         cores: smp.order(),
     };
     ui.screen.log(format!(
@@ -373,7 +381,7 @@ fn est(secs: u64) -> String {
 /// Menu with a countdown to the quick check or, after a run, the result screen with the same choices.
 fn choose(ui: &mut Ui, cfg: &Config, countdown: bool) -> Option<Job> {
     let gib10 = (ram::usable_total() * 10) >> 30;
-    let sweep_secs = |j: &Job| gib10 * memtest::sweeps(&j.tests) * memtest::SWEEP_MS_PER_GIB / 10_000;
+    let sweep_secs = |j: &Job| eta::pass_ms(&j.tests, gib10 as f64 / 10.0) / 1000;
     let quick = Job::from_mode(Mode::Quick, cfg);
     let full =
         Job { name: "Full memory test", tests: once(&memtest::DEFAULT), cycles: 1, ..Job::from_mode(Mode::Mem, cfg) };
@@ -442,6 +450,7 @@ fn run_job(ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, plans: &[Plan], job: 
     ui.next_mem = 0;
     ui.next_burn = 0;
     ui.places = Places::default();
+    (ui.rate, ui.test_left, ui.job_left) = (Rate::default(), Shown::default(), Shown::default());
     let v = &mut ui.view;
     v.job = String::from(job.name);
     v.plan = job.plan(&ui.cores);
@@ -652,8 +661,15 @@ fn test_passes(
     let tested: u64 = chunks.iter().map(|c| c.words as u64 * 8).sum();
     let tests = &job.tests;
     let per_pass = memtest::sweeps(tests) * tested;
+    let pass_traffic = eta::pass_traffic(tests, tested);
+    let pass_holds: u64 = tests.iter().map(|&(t, r)| eta::holds(t, r)).sum();
+    let hold_ms = cfg.fade_secs * 1000;
+    let burn_ms = job.burn_secs.unwrap_or(0) * 1000;
+    let cycle = first_pass / job.passes.max(1);
+    let later_cycles = if job.cycles == 0 { 0 } else { job.cycles.saturating_sub(cycle + 1) };
+    let job_label = if job.cycles == 0 { "cycle" } else { "job" };
+    let mut held = 0u64;
     let moved = Moved::default();
-    let start = cpu::rdtsc();
     ui.rebase(0);
     let clock = ui.clock;
 
@@ -661,6 +677,8 @@ fn test_passes(
         let pass = first_pass + p;
         for (ti, &(t, rounds)) in tests.iter().enumerate() {
             let (t0, b0, e0) = (cpu::rdtsc(), moved.traffic(), sh.log.count());
+            let (test_traffic, test_holds, held0) = (eta::test_traffic(t, rounds, tested), eta::holds(t, rounds), held);
+            ui.test_left.reset();
             if row.is_none() {
                 ui.step(ti, StepState::Running);
             }
@@ -673,9 +691,25 @@ fn test_passes(
                     }
                     let d = moved.tested();
                     let in_pass = (d - (p * per_pass).min(d)).min(per_pass);
-                    let ms = clock.ms_since(start);
-                    let left_ms = (per_pass - in_pass) as u128 * ms as u128 / d.max(1) as u128;
-                    ui.sample(Some(moved.traffic()), None);
+                    let m = moved.traffic();
+                    let now_ms = clock.ms_since(ui.t0);
+                    ui.rate.sample(now_ms, m);
+                    let rate = &ui.rate;
+                    let test = rate
+                        .ms(test_traffic.saturating_sub(m - b0))
+                        .map(|ms| ms + (test_holds - (held - held0)) * hold_ms);
+                    let all = passes * pass_traffic;
+                    let holds_left = passes * pass_holds - held;
+                    let later = rate
+                        .ms(job.passes * pass_traffic)
+                        .map(|ms| later_cycles * (ms + job.passes * pass_holds * hold_ms + burn_ms));
+                    let job_ms = rate
+                        .ms(all.saturating_sub(m))
+                        .zip(later)
+                        .map(|(ms, l)| ms + holds_left * hold_ms + burn_ms + l);
+                    let (left_ms, job_left_ms) =
+                        (ui.test_left.update(now_ms, test), ui.job_left.update(now_ms, job_ms));
+                    ui.sample(Some(m), None);
                     ui.view.current = Current::Mem {
                         test: t,
                         pass: p as u32 + 1,
@@ -686,7 +720,9 @@ fn test_passes(
                         steps: rounds * t.phases() as u32,
                         done: (in_pass as u128 * tested as u128 / per_pass.max(1) as u128) as u64,
                         total: tested,
-                        left_ms: (d > 0).then_some(left_ms as u64),
+                        left_ms,
+                        job_left_ms,
+                        job_label,
                     };
                     ui.refresh(sh);
                 };
@@ -704,6 +740,8 @@ fn test_passes(
                             ui.refresh(sh);
                         }
                     }
+                    held += 1;
+                    ui.rate.pause();
                 }
             }
             ui.report(sh);

@@ -1,79 +1,211 @@
-//! Stick self-update: checks the signed release manifest, then replaces the stick's boot files.
+//! Stick self-update: waits for the network, checks the signed release manifest, stages the new files beside
+//! the stick's files in the background, and swaps them in when asked.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use memburn_proto::release::{self, Envelope, Manifest};
+use memburn_proto::release::{self, Envelope, Manifest, StickFile};
+use sha2::{Digest, Sha256};
 
-/// The check gives up this long after start; each request has [`REQUEST`].
-const CHECK_FOR: Duration = Duration::from_secs(10);
-const REQUEST: Duration = Duration::from_secs(3);
-const RETRY: Duration = Duration::from_secs(2);
+const REQUEST: Duration = Duration::from_secs(10);
+/// Retry delays after a failed check: doubling from the first to the last.
+const BACKOFF: (Duration, Duration) = (Duration::from_secs(2), Duration::from_secs(60));
+const ROUTE_POLL: Duration = Duration::from_secs(1);
 /// Free space kept on the stick beyond the new files.
 const SPARE: u64 = 1 << 20;
 const GRUB_CFGS: [&str; 2] = ["EFI/ubuntu/grub.cfg", "EFI/BOOT/grub.cfg"];
 const VERSIONS: &str = "EFI/memburn";
+/// The initramfs's init, compared with the release's `memburn-init`.
+const INIT: &str = "/init";
+/// Where the stick's init looks for the new memburn binary and its extra arguments (one per line) after exit 12.
+pub const NEXT: &str = "/memburn-next";
+pub const NEXT_ARGS: &str = "/memburn-next.args";
 
-#[derive(Clone)]
-pub enum Check {
-    Pending,
-    /// No newer release, no answer, or the stick is not updatable.
+#[derive(Clone, Debug, PartialEq)]
+pub enum State {
+    /// Waiting for a network route or a server answer.
+    Checking,
+    /// No newer release, or the stick is not updatable.
     Nothing,
     /// The manifest failed its checks.
     Rejected(String),
-    /// A newer release; `fits` is false when the stick has too little space.
-    Offer {
-        manifest: Box<Manifest>,
-        fits: bool,
+    /// A newer release that does not fit on the stick.
+    NoSpace(String),
+    Staging {
+        version: String,
+        done: u64,
+        total: u64,
+    },
+    Failed {
+        version: String,
+        error: String,
+    },
+    /// Every file is written beside the stick's files and checked; [`Updater::install`] swaps them in.
+    Ready(Box<Staged>),
+    Installed {
+        version: String,
+        next: Next,
     },
 }
 
-/// Starts the background check of `{server}/memburn/api/latest` against the stick at `stick`.
-pub fn start(server: &str, stick: PathBuf) -> Arc<Mutex<Check>> {
-    let state = Arc::new(Mutex::new(Check::Pending));
-    let (s, url) = (state.clone(), format!("{server}/memburn/api/latest"));
-    std::thread::spawn(move || {
-        let result = check(&url, &stick);
-        *s.lock().unwrap() = result;
-    });
-    state
+/// How the new version starts in this session.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Next {
+    /// Only memburn changed: init runs the new binary at `bin` (a stick path), hash `sha256`.
+    Reexec { bin: PathBuf, sha256: String },
+    /// The kernel or init changed.
+    Reboot,
 }
 
-/// Waits until the check is done.
-pub fn wait(state: &Mutex<Check>) -> Check {
-    loop {
-        let c = state.lock().unwrap().clone();
-        if !matches!(c, Check::Pending) {
-            return c;
+#[derive(Clone, Debug, PartialEq)]
+pub struct Staged {
+    pub version: String,
+    old_version: String,
+    /// Staged paths, grub.cfg last.
+    paths: Vec<String>,
+    pub next: Next,
+}
+
+pub struct Updater {
+    state: Mutex<State>,
+    opted: AtomicBool,
+    stick: PathBuf,
+}
+
+impl Updater {
+    pub fn state(&self) -> State {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn set(&self, s: State) {
+        *self.state.lock().unwrap() = s;
+    }
+
+    /// The newer version U starts: downloading, ready, or installed for the next boot.
+    pub fn offer(&self) -> Option<String> {
+        match &*self.state.lock().unwrap() {
+            State::Staging { version, .. } | State::Installed { version, .. } => Some(version.clone()),
+            State::Ready(s) => Some(s.version.clone()),
+            _ => None,
         }
-        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    /// Install and start the new version as soon as it is ready (the U key, `update=auto`).
+    pub fn opt_in(&self) {
+        self.opted.store(true, Ordering::Relaxed);
+    }
+
+    pub fn opted(&self) -> bool {
+        self.opted.load(Ordering::Relaxed)
+    }
+
+    /// Opted in and ready: the run should stop so the new version can start.
+    pub fn due(&self) -> bool {
+        self.opted() && matches!(*self.state.lock().unwrap(), State::Ready(_))
+    }
+
+    /// Swaps in a ready update; the new version, when it did.
+    pub fn install(&self) -> Option<Result<String, String>> {
+        let staged = {
+            let mut s = self.state.lock().unwrap();
+            let State::Ready(st) = &*s else { return None };
+            let st = st.clone();
+            *s = State::Checking;
+            st
+        };
+        let result = swap(&self.stick, &staged);
+        self.set(match &result {
+            Ok(()) => State::Installed { version: staged.version.clone(), next: staged.next.clone() },
+            Err(e) => State::Failed { version: staged.version.clone(), error: e.clone() },
+        });
+        Some(result.map(|_| staged.version))
     }
 }
 
-fn check(url: &str, stick: &Path) -> Check {
+/// Starts the background check of `{server}/memburn/api/latest` against the stick at `stick`; a newer release that
+/// fits is staged right away.
+pub fn start(server: &str, stick: PathBuf) -> Arc<Updater> {
+    let u = Arc::new(Updater { state: Mutex::new(State::Checking), opted: AtomicBool::new(false), stick });
+    let (w, url) = (u.clone(), format!("{server}/memburn/api/latest"));
+    std::thread::spawn(move || {
+        low_priority();
+        let m = match check(&url, &w.stick) {
+            Ok(m) => m,
+            Err(s) => return w.set(s),
+        };
+        let (version, total) = (m.version.clone(), m.tar.size);
+        let progress = |done| w.set(State::Staging { version: version.clone(), done, total });
+        progress(0);
+        w.set(match stage(&m, &w.stick, &progress, &booted()) {
+            Ok(s) => State::Ready(Box::new(s)),
+            Err(error) => State::Failed { version, error },
+        });
+    });
+    u
+}
+
+/// Nice 19 and idle I/O for the calling thread, so staging does not slow the test.
+fn low_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 19);
+        // IOPRIO_WHO_PROCESS, IOPRIO_CLASS_IDLE << 13.
+        libc::syscall(libc::SYS_ioprio_set, 1, tid, 3 << 13);
+    }
+}
+
+/// A default route exists (Linux); elsewhere assumed.
+fn has_route() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/net/route").is_ok_and(|t| t.lines().skip(1).any(default_route))
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+/// A /proc/net/route line for an up default route.
+#[cfg(any(target_os = "linux", test))]
+fn default_route(line: &str) -> bool {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    f.len() > 3 && f[1] == "00000000" && u32::from_str_radix(f[3], 16).is_ok_and(|flags| flags & 1 != 0)
+}
+
+/// The signed manifest, retried with backoff once a route exists until the server answers.
+fn fetch_manifest(url: &str) -> Result<Manifest, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(REQUEST)).build().into();
-    let t0 = Instant::now();
+    let mut delay = BACKOFF.0;
     let env: Envelope = loop {
+        while !has_route() {
+            std::thread::sleep(ROUTE_POLL);
+        }
         match agent.get(url).call() {
-            Ok(mut r) => match r.body_mut().read_json() {
-                Ok(e) => break e,
-                Err(e) => return Check::Rejected(format!("bad manifest: {e}")),
-            },
-            Err(ureq::Error::StatusCode(_)) => return Check::Nothing,
-            Err(_) if t0.elapsed() + RETRY < CHECK_FOR => std::thread::sleep(RETRY),
-            Err(_) => return Check::Nothing,
+            Ok(mut r) => break r.body_mut().read_json().map_err(|e| format!("bad manifest: {e}"))?,
+            Err(ureq::Error::StatusCode(c)) if c < 500 => return Err(format!("HTTP {c}")),
+            Err(_) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(BACKOFF.1);
+            }
         }
     };
-    let manifest = match release::verify(&env, release::RELEASE_KEY) {
+    release::verify(&env, release::RELEASE_KEY)
+}
+
+/// A newer release that fits on the stick, or the state to stop at.
+fn check(url: &str, stick: &Path) -> Result<Manifest, State> {
+    let manifest = match fetch_manifest(url) {
         Ok(m) => m,
-        Err(e) => return Check::Rejected(e),
+        Err(e) if e.starts_with("HTTP ") => return Err(State::Nothing),
+        Err(e) => return Err(State::Rejected(e)),
     };
-    let Some(current) = installed(stick) else { return Check::Nothing };
+    let Some(current) = installed(stick) else { return Err(State::Nothing) };
     if !release::newer(&manifest.version, env!("CARGO_PKG_VERSION")) || !release::newer(&manifest.version, &current) {
-        return Check::Nothing;
+        return Err(State::Nothing);
     }
     let fits = crate::os::free_bytes(stick).is_none_or(|free| {
         let need: u64 = manifest
@@ -84,7 +216,39 @@ fn check(url: &str, stick: &Path) -> Check {
             .sum();
         need + SPARE <= free + stale(stick, &current, &manifest.version).iter().map(|d| dir_bytes(d)).sum::<u64>()
     });
-    Check::Offer { manifest: Box::new(manifest), fits }
+    if !fits {
+        return Err(State::NoSpace(manifest.version));
+    }
+    Ok(manifest)
+}
+
+/// SHA-256 of the booted kernel and init, when known.
+#[derive(Default)]
+pub struct Booted {
+    kernel: Option<String>,
+    init: Option<String>,
+}
+
+fn booted() -> Booted {
+    let hash = |p: &Path| fs::read(p).ok().map(|d| release::sha256_hex(&d));
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let image = cmdline.split_whitespace().find_map(|a| a.strip_prefix("BOOT_IMAGE="));
+    Booted {
+        kernel: image.and_then(|i| hash(&Path::new("/stick").join(i.trim_start_matches('/')))),
+        init: hash(Path::new(INIT)),
+    }
+}
+
+/// Re-exec when the release has a memburn binary and the same kernel and init as booted.
+fn next(m: &Manifest, booted: &Booted) -> Next {
+    let file = |name: &str| m.files.iter().find(|f| f.path == format!("{VERSIONS}/{}/{name}", m.version));
+    let same = |name: &str, have: &Option<String>| file(name).zip(have.as_ref()).is_some_and(|(f, h)| f.sha256 == *h);
+    match file("memburn") {
+        Some(bin) if same("vmlinuz", &booted.kernel) && same("memburn-init", &booted.init) => {
+            Next::Reexec { bin: PathBuf::from(&bin.path), sha256: bin.sha256.clone() }
+        }
+        _ => Next::Reboot,
+    }
 }
 
 /// The version the stick's GRUB menu boots by default, from its `#BEGIN memburn X` line.
@@ -164,33 +328,6 @@ fn dir_bytes(dir: &Path) -> u64 {
     fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
 }
 
-/// Regular files of a ustar archive, as (path, contents).
-pub fn untar(data: &[u8]) -> Result<Vec<(String, &[u8])>, String> {
-    let field = |h: &[u8], a: usize, b: usize| {
-        let f = &h[a..b];
-        String::from_utf8_lossy(&f[..f.iter().position(|&c| c == 0).unwrap_or(f.len())]).into_owned()
-    };
-    let mut files = Vec::new();
-    let mut at = 0;
-    while at + 512 <= data.len() {
-        let h = &data[at..at + 512];
-        if h.iter().all(|&b| b == 0) {
-            return Ok(files);
-        }
-        let size = u64::from_str_radix(field(h, 124, 136).trim(), 8).map_err(|_| "bad tar header")? as usize;
-        let prefix = field(h, 345, 500);
-        let name = field(h, 0, 100);
-        let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
-        let body = at + 512;
-        let end = body.checked_add(size).filter(|&e| e <= data.len()).ok_or("truncated tar")?;
-        if matches!(h[156], b'0' | 0) {
-            files.push((path, &data[body..end]));
-        }
-        at = body + size.div_ceil(512) * 512;
-    }
-    Err("truncated tar".into())
-}
-
 fn sync() {
     #[cfg(unix)]
     unsafe {
@@ -221,38 +358,65 @@ fn swap_cfgs(stick: &Path, cfgs: &[(&str, String)]) -> Result<(), String> {
     Ok(())
 }
 
-/// Downloads `m`'s files, checks every hash, writes them beside the stick's files and swaps them in,
-/// grub.cfg last; the version GRUB booted so far stays as the previous entry. `say` gets progress.
-/// On an error before the swap the stick is unchanged.
-pub fn apply(m: &Manifest, stick: &Path, say: &dyn Fn(String)) -> Result<(), String> {
+fn hex(d: impl AsRef<[u8]>) -> String {
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn file_sha(p: &Path) -> Option<(u64, String)> {
+    let mut f = fs::File::open(p).ok()?;
+    let (mut h, mut n, mut buf) = (Sha256::new(), 0u64, vec![0u8; 1 << 16]);
+    loop {
+        let k = f.read(&mut buf).ok()?;
+        if k == 0 {
+            return Some((n, hex(h.finalize())));
+        }
+        h.update(&buf[..k]);
+        n += k as u64;
+    }
+}
+
+/// Reads exactly `buf.len()` bytes into `buf`, hashing them into `tar` and counting them.
+fn take(r: &mut dyn Read, buf: &mut [u8], tar: &mut Sha256, done: &mut u64) -> Result<(), String> {
+    r.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            "truncated download".into()
+        } else {
+            format!("download: {e}")
+        }
+    })?;
+    tar.update(&*buf);
+    *done += buf.len() as u64;
+    Ok(())
+}
+
+fn field(h: &[u8], a: usize, b: usize) -> String {
+    let f = &h[a..b];
+    String::from_utf8_lossy(&f[..f.iter().position(|&c| c == 0).unwrap_or(f.len())]).into_owned()
+}
+
+/// Streams `m`'s tar from `r` into `<path>.new` beside every stick file that differs, checking each file's and the
+/// tar's hash. On an error every staged file is removed and the stick is as before.
+fn stage_from(
+    m: &Manifest,
+    stick: &Path,
+    r: &mut dyn Read,
+    progress: &dyn Fn(u64),
+    booted: &Booted,
+) -> Result<Staged, String> {
     let (old_version, old_block) = fs::read_to_string(stick.join(GRUB_CFGS[1]))
         .ok()
         .and_then(|c| block(&c))
         .ok_or("the stick's grub.cfg has no version block")?;
-    let tar = download(m, say)?;
-    say(String::from("checking"));
-    let files = untar(&tar)?;
-    let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
+    let staged = |p: &str| stick.join(format!("{p}.new"));
     for f in &m.files {
-        let (_, data) = files.iter().find(|(p, _)| *p == f.path).ok_or(format!("{} missing", f.path))?;
-        if data.len() as u64 != f.size || release::sha256_hex(data) != f.sha256 {
-            return Err(format!("{}: hash mismatch", f.path));
-        }
-        let data = if GRUB_CFGS.contains(&f.path.as_str()) {
-            let cfg = String::from_utf8_lossy(data);
-            with_previous(&cfg, &old_version, &old_block).into_bytes()
-        } else {
-            data.to_vec()
-        };
-        if fs::read(stick.join(&f.path)).ok().as_deref() != Some(&data[..]) {
-            writes.push((f.path.clone(), data));
-        }
+        let _ = fs::remove_file(staged(&f.path));
     }
-    let need: u64 = writes.iter().map(|(_, d)| d.len() as u64).sum::<u64>() + SPARE;
+    let cfg = |p: &str| GRUB_CFGS.contains(&p);
+    let differs = |f: &StickFile| cfg(&f.path) || file_sha(&stick.join(&f.path)) != Some((f.size, f.sha256.clone()));
+    let need: u64 = m.files.iter().filter(|f| differs(f)).map(|f| f.size).sum::<u64>() + SPARE;
     let free = || crate::os::free_bytes(stick).unwrap_or(u64::MAX);
     let stale_dirs = stale(stick, &old_version, &m.version);
     if free() < need && !stale_dirs.is_empty() {
-        say(String::from("removing the previous version"));
         let cfgs: Vec<(&str, String)> = GRUB_CFGS
             .iter()
             .filter_map(|p| Some((*p, without_previous(&fs::read_to_string(stick.join(p)).ok()?))))
@@ -266,69 +430,156 @@ pub fn apply(m: &Manifest, stick: &Path, say: &dyn Fn(String)) -> Result<(), Str
     if free() < need {
         return Err(format!("{} MiB free on the stick, {} MiB needed", free() >> 20, need >> 20));
     }
-    let staged = |p: &str| stick.join(format!("{p}.new"));
-    let clean = |n: usize| {
-        for (p, _) in &writes[..n] {
+    let mut written: Vec<String> = Vec::new();
+    let result = (|| {
+        let (mut tar, mut done) = (Sha256::new(), 0u64);
+        let mut seen: Vec<&str> = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut h = [0u8; 512];
+        loop {
+            take(r, &mut h, &mut tar, &mut done)?;
+            if h.iter().all(|&b| b == 0) {
+                break;
+            }
+            let size = u64::from_str_radix(field(&h, 124, 136).trim(), 8).map_err(|_| "bad tar header")?;
+            let (prefix, name) = (field(&h, 345, 500), field(&h, 0, 100));
+            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let regular = matches!(h[156], b'0' | 0);
+            let want = m.files.iter().find(|f| regular && f.path == path);
+            let write = want.filter(|f| differs(f));
+            if let Some(f) = want
+                && f.size != size
+            {
+                return Err(format!("{path}: size mismatch"));
+            }
+            let mut out = match write {
+                Some(f) if !cfg(&f.path) => {
+                    let p = staged(&f.path);
+                    if let Some(dir) = p.parent() {
+                        fs::create_dir_all(dir).map_err(|e| format!("{path}: {e}"))?;
+                    }
+                    written.push(f.path.clone());
+                    Some(fs::File::create(&p).map_err(|e| format!("{path}: {e}"))?)
+                }
+                _ => None,
+            };
+            let mut text: Vec<u8> = Vec::new();
+            let mut file = Sha256::new();
+            let mut left = size;
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                take(r, &mut buf[..n], &mut tar, &mut done)?;
+                file.update(&buf[..n]);
+                if let Some(o) = &mut out {
+                    o.write_all(&buf[..n]).map_err(|e| format!("{path}: {e}"))?;
+                } else if write.is_some() {
+                    text.extend_from_slice(&buf[..n]);
+                }
+                left -= n as u64;
+                progress(done);
+            }
+            let pad = (size.div_ceil(512) * 512 - size) as usize;
+            take(r, &mut buf[..pad], &mut tar, &mut done)?;
+            if let Some(f) = want {
+                if hex(file.finalize()) != f.sha256 {
+                    return Err(format!("{path}: hash mismatch"));
+                }
+                seen.push(&f.path);
+            }
+            if let Some(o) = out {
+                o.sync_all().map_err(|e| format!("{path}: {e}"))?;
+            } else if let Some(f) = write {
+                let new = with_previous(&String::from_utf8_lossy(&text), &old_version, &old_block);
+                if fs::read(stick.join(&f.path)).ok().as_deref() != Some(new.as_bytes()) {
+                    written.push(f.path.clone());
+                    write_synced(&staged(&f.path), new.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+                }
+            }
+        }
+        loop {
+            let n = r.read(&mut buf).map_err(|e| format!("download: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            tar.update(&buf[..n]);
+            done += n as u64;
+        }
+        if done != m.tar.size {
+            return Err(format!("download: {done} of {} bytes", m.tar.size));
+        }
+        if hex(tar.finalize()) != m.tar.sha256 {
+            return Err(String::from("download: hash mismatch"));
+        }
+        if let Some(f) = m.files.iter().find(|f| !seen.contains(&f.path.as_str())) {
+            return Err(format!("{} missing", f.path));
+        }
+        Ok(())
+    })();
+    sync();
+    if let Err(e) = result {
+        for p in &written {
             let _ = fs::remove_file(staged(p));
         }
+        let _ = fs::remove_dir(stick.join(VERSIONS).join(&m.version));
         sync();
-    };
-    for (k, (p, data)) in writes.iter().enumerate() {
-        say(format!("writing {p}"));
-        if let Err(e) = write_synced(&staged(p), data) {
-            clean(k + 1);
-            return Err(format!("{p}: {e}"));
-        }
+        return Err(e);
+    }
+    let (cfgs, mut paths): (Vec<String>, Vec<String>) = written.into_iter().partition(|p| cfg(p));
+    paths.extend(cfgs);
+    Ok(Staged { version: m.version.clone(), old_version, paths, next: next(m, booted) })
+}
+
+/// Downloads and stages `m` (see [`stage_from`]); `progress` gets the bytes downloaded.
+fn stage(m: &Manifest, stick: &Path, progress: &dyn Fn(u64), booted: &Booted) -> Result<Staged, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(1800)))
+        .build()
+        .into();
+    let mut r = agent.get(&m.tar.url).call().map_err(|e| format!("download: {e}"))?;
+    let mut body = r.body_mut().with_config().limit(m.tar.size + 1).reader();
+    stage_from(m, stick, &mut body, progress, booted)
+}
+
+/// Renames the staged files over the stick's, grub.cfg last, then removes versions older than the previous one.
+fn swap(stick: &Path, s: &Staged) -> Result<(), String> {
+    for p in &s.paths {
+        fs::rename(stick.join(format!("{p}.new")), stick.join(p)).map_err(|e| format!("{p}: {e}"))?;
     }
     sync();
-    say(String::from("switching"));
-    let (cfgs, rest): (Vec<_>, Vec<_>) = writes.iter().partition(|(p, _)| GRUB_CFGS.contains(&p.as_str()));
-    for (p, _) in rest.iter().chain(cfgs.iter()) {
-        fs::rename(staged(p), stick.join(p)).map_err(|e| format!("{p}: {e}"))?;
-    }
-    sync();
-    for d in stale(stick, &old_version, &m.version) {
+    for d in stale(stick, &s.old_version, &s.version) {
         let _ = fs::remove_dir_all(d);
     }
     sync();
     Ok(())
 }
 
-fn download(m: &Manifest, say: &dyn Fn(String)) -> Result<Vec<u8>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_body(Some(Duration::from_secs(600)))
-        .build()
-        .into();
-    let mut r = agent.get(&m.tar.url).call().map_err(|e| format!("download: {e}"))?;
-    let mut body = r.body_mut().with_config().limit(m.tar.size + 1).reader();
-    let mut data = Vec::with_capacity(m.tar.size as usize);
-    let mut buf = vec![0u8; 1 << 16];
-    let mut shown = Instant::now();
-    loop {
-        let n = body.read(&mut buf).map_err(|e| format!("download: {e}"))?;
-        if n == 0 {
-            break;
+/// Copies the new binary of a [`Next::Reexec`] to [`NEXT`] with `args` for init; false if it does not check out.
+pub fn hand_over(stick: &Path, bin: &Path, sha256: &str, args: &[String]) -> bool {
+    let tmp = format!("{NEXT}.tmp");
+    let ok = fs::copy(stick.join(bin), &tmp).is_ok()
+        && file_sha(Path::new(&tmp)).is_some_and(|(_, h)| h == sha256)
+        && {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).is_ok()
+            }
+            #[cfg(not(unix))]
+            true
         }
-        data.extend_from_slice(&buf[..n]);
-        if shown.elapsed() > Duration::from_millis(250) {
-            shown = Instant::now();
-            say(format!("downloading {} / {} MiB", data.len() >> 20, m.tar.size >> 20));
-        }
+        && fs::write(NEXT_ARGS, args.join("\n")).is_ok()
+        && fs::rename(&tmp, NEXT).is_ok();
+    if !ok {
+        let _ = fs::remove_file(&tmp);
     }
-    if data.len() as u64 != m.tar.size {
-        return Err(format!("download: {} of {} bytes", data.len(), m.tar.size));
-    }
-    if release::sha256_hex(&data) != m.tar.sha256 {
-        return Err(String::from("download: hash mismatch"));
-    }
-    Ok(data)
+    ok
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memburn_proto::release::{Download, StickFile};
+    use memburn_proto::release::Download;
 
     const CFG: &str = "set default=0\n#BEGIN memburn @V@\nmenuentry \"memburn @V@  (x)\" {\n    linux /EFI/memburn/@V@/vmlinuz\n}\n#END\n#PREVIOUS\nmenuentry \"UEFI firmware settings\" {\n}\n";
 
@@ -367,25 +618,27 @@ mod tests {
     }
 
     #[test]
-    fn tar_files() {
-        let t = tar(&[("a/b.txt", b"hello"), ("c", &[7u8; 600])]);
-        let f = untar(&t).unwrap();
-        assert_eq!(f[0], ("a/b.txt".to_string(), &b"hello"[..]));
-        assert_eq!(f[1].1.len(), 600);
-        assert!(untar(&t[..1000]).is_err());
+    fn routes() {
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     eth0\t0002000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\n\
+                     eth0\t00000000\t0202000A\t0003\t0\t0\t0\t00000000\n";
+        assert!(table.lines().skip(1).any(default_route));
+        assert!(!table.lines().take(2).skip(1).any(default_route));
+        assert!(!default_route("eth0\t00000000\t0202000A\t0002\t0\t0\t0\t00000000"));
     }
 
-    /// A stick tree at version 0.5.0 and a manifest for 0.5.1 served from a one-shot local HTTP server.
-    fn setup(name: &str, tamper: bool) -> (PathBuf, Manifest, std::thread::JoinHandle<()>) {
+    /// A stick tree at version 0.5.0 and a 0.5.1 release tar with its manifest.
+    fn setup(name: &str, tamper: bool) -> (PathBuf, Manifest, Vec<u8>) {
         let stick = std::env::temp_dir().join(format!("memburn-update-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&stick);
         for (p, data) in [
             ("EFI/BOOT/grub.cfg", cfg("0.5.0").into_bytes()),
             ("EFI/ubuntu/grub.cfg", cfg("0.5.0").into_bytes()),
-            ("EFI/memburn/0.5.0/vmlinuz", b"old kernel".to_vec()),
+            ("EFI/memburn/0.5.0/vmlinuz", b"kernel".to_vec()),
             ("EFI/memburn/0.4.9/vmlinuz", b"older kernel".to_vec()),
             ("memburn.cfg", b"mode=quick".to_vec()),
             ("README.txt", b"old readme".to_vec()),
+            ("windows/memburn.exe", b"exe".to_vec()),
         ] {
             write_synced(&stick.join(p), &data).unwrap();
         }
@@ -393,8 +646,11 @@ mod tests {
         let files: Vec<(&str, &[u8])> = vec![
             ("EFI/BOOT/grub.cfg", new_cfg.as_bytes()),
             ("EFI/ubuntu/grub.cfg", new_cfg.as_bytes()),
-            ("EFI/memburn/0.5.1/vmlinuz", b"new kernel"),
+            ("EFI/memburn/0.5.1/vmlinuz", b"kernel"),
+            ("EFI/memburn/0.5.1/memburn", &[9u8; 700]),
+            ("EFI/memburn/0.5.1/memburn-init", b"init"),
             ("README.txt", b"new readme"),
+            ("windows/memburn.exe", b"exe"),
         ];
         let t = tar(&files);
         let manifest = Manifest {
@@ -410,16 +666,7 @@ mod tests {
                 .collect(),
             assets: vec![],
         };
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/s.tar", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut c, _) = listener.accept().unwrap();
-            let mut req = [0u8; 4096];
-            let _ = c.read(&mut req);
-            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", t.len());
-            let _ = c.write_all(&t);
-        });
-        (stick, Manifest { tar: Download { url, ..manifest.tar }, ..manifest }, server)
+        (stick, manifest, t)
     }
 
     fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -435,14 +682,31 @@ mod tests {
         out
     }
 
+    fn booted_as(kernel: &[u8], init: &[u8]) -> Booted {
+        Booted { kernel: Some(release::sha256_hex(kernel)), init: Some(release::sha256_hex(init)) }
+    }
+
     #[test]
-    fn update_swaps_files_and_keeps_the_previous_version() {
-        let (stick, m, server) = setup("ok", false);
-        apply(&m, &stick, &|_| {}).unwrap();
-        server.join().unwrap();
+    fn staged_files_swap_in_and_keep_the_previous_version() {
+        let (stick, m, t) = setup("ok", false);
+        let before = snapshot(&stick);
+        let last = std::cell::Cell::new(0);
+        let s = stage_from(&m, &stick, &mut &t[..], &|d| last.set(d), &booted_as(b"kernel", b"init")).unwrap();
+        assert!(last.get() > 0 && last.get() <= t.len() as u64);
         let read = |p: &str| fs::read_to_string(stick.join(p)).unwrap_or_default();
-        assert_eq!(read("EFI/memburn/0.5.1/vmlinuz"), "new kernel");
-        assert_eq!(read("EFI/memburn/0.5.0/vmlinuz"), "old kernel");
+        assert_eq!(read("EFI/memburn/0.5.1/vmlinuz.new"), "kernel");
+        assert!(!stick.join("windows/memburn.exe.new").exists());
+        assert!(s.paths[s.paths.len() - 2..].iter().all(|p| GRUB_CFGS.contains(&p.as_str())), "{:?}", s.paths);
+        assert_eq!(
+            s.next,
+            Next::Reexec { bin: "EFI/memburn/0.5.1/memburn".into(), sha256: release::sha256_hex(&[9u8; 700]) }
+        );
+        let unstaged: Vec<_> =
+            snapshot(&stick).into_iter().filter(|(p, _)| !p.to_string_lossy().ends_with(".new")).collect();
+        assert_eq!(unstaged, before);
+        swap(&stick, &s).unwrap();
+        assert_eq!(read("EFI/memburn/0.5.1/vmlinuz"), "kernel");
+        assert_eq!(read("EFI/memburn/0.5.0/vmlinuz"), "kernel");
         assert!(!stick.join("EFI/memburn/0.4.9").exists());
         assert_eq!(read("README.txt"), "new readme");
         assert_eq!(read("memburn.cfg"), "mode=quick");
@@ -457,23 +721,66 @@ mod tests {
     }
 
     #[test]
+    fn a_new_kernel_or_init_reboots() {
+        let (stick, m, _) = setup("next", false);
+        assert_eq!(next(&m, &booted_as(b"other kernel", b"init")), Next::Reboot);
+        assert_eq!(next(&m, &booted_as(b"kernel", b"other init")), Next::Reboot);
+        assert_eq!(next(&m, &Booted::default()), Next::Reboot);
+        let old = Manifest { files: m.files.iter().filter(|f| !f.path.ends_with("/memburn")).cloned().collect(), ..m };
+        assert_eq!(next(&old, &booted_as(b"kernel", b"init")), Next::Reboot);
+        let _ = fs::remove_dir_all(stick);
+    }
+
+    #[test]
     fn a_bad_hash_leaves_the_stick_unchanged() {
-        let (stick, m, server) = setup("hash", true);
+        let (stick, m, t) = setup("hash", true);
         let before = snapshot(&stick);
-        assert_eq!(apply(&m, &stick, &|_| {}), Err("EFI/memburn/0.5.1/vmlinuz: hash mismatch".into()));
-        server.join().unwrap();
+        let r = stage_from(&m, &stick, &mut &t[..], &|_| {}, &Booted::default());
+        assert_eq!(r, Err("EFI/memburn/0.5.1/vmlinuz: hash mismatch".into()));
         assert_eq!(snapshot(&stick), before);
         let _ = fs::remove_dir_all(stick);
     }
 
     #[test]
-    fn a_short_download_leaves_the_stick_unchanged() {
-        let (stick, m, server) = setup("short", false);
+    fn a_short_or_bad_download_leaves_the_stick_unchanged() {
+        let (stick, m, t) = setup("short", false);
         let before = snapshot(&stick);
-        let m = Manifest { tar: Download { size: m.tar.size + 512, ..m.tar.clone() }, ..m };
-        assert!(apply(&m, &stick, &|_| {}).unwrap_err().starts_with("download:"));
-        server.join().unwrap();
+        let r = stage_from(&m, &stick, &mut &t[..t.len() - 1500], &|_| {}, &Booted::default());
+        assert_eq!(r, Err("truncated download".into()));
         assert_eq!(snapshot(&stick), before);
+        let mut bad = t.clone();
+        bad[t.len() - 1] = 1;
+        let r = stage_from(&m, &stick, &mut &bad[..], &|_| {}, &Booted::default());
+        assert_eq!(r, Err("download: hash mismatch".into()));
+        assert_eq!(snapshot(&stick), before);
+        let _ = fs::remove_dir_all(stick);
+    }
+
+    #[test]
+    fn a_bad_signature_stages_nothing() {
+        let (stick, m, _) = setup("live", false);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let m = Manifest { tar: Download { url: format!("{base}/s.tar"), ..m.tar.clone() }, ..m };
+        let env = Envelope { manifest: serde_json::to_string(&m).unwrap(), sig: String::new() };
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = c.read(&mut req).unwrap();
+            let body = serde_json::to_vec(&env).unwrap();
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = c.write_all(&body);
+        });
+        let u = start(&base, stick.clone());
+        for _ in 0..100 {
+            if !matches!(u.state(), State::Checking) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(u.state(), State::Rejected("bad signature".into()));
+        server.join().unwrap();
+        assert!(snapshot(&stick).iter().all(|(p, _)| !p.to_string_lossy().ends_with(".new")));
         let _ = fs::remove_dir_all(stick);
     }
 }

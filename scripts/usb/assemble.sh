@@ -47,7 +47,7 @@ truncate -s 96M $img
 echo 'start=2048, type=ef, bootable' | sfdisk -q $img
 fat="$img@@1M"
 mformat -i "$fat" -F -v "$label" ::
-# The FAT tree: boot files, this version's kernel, initrd and UEFI build, and the Windows exe.
+# The FAT tree: boot files, this version's kernel, initrd, binaries and UEFI build, and the Windows exe.
 tree=$work/tree; ver=$tree/EFI/memburn/$VERSION
 mkdir -p $tree/EFI/BOOT $tree/EFI/ubuntu $ver $tree/windows
 cp $root/usr/lib/shim/shimx64.efi.signed.latest $tree/EFI/BOOT/BOOTX64.EFI
@@ -58,6 +58,9 @@ cp $tree/EFI/BOOT/grub.cfg $tree/EFI/ubuntu/grub.cfg
 cp $root/boot/vmlinuz-"$KERNEL" $ver/vmlinuz
 cp initrd.img $ver/initrd.img
 cp /in/memburn-uefi.efi $ver/memburn.efi
+# The initrd's memburn and init again, so an update can restart memburn in place when only it changed.
+cp /in/memburn $ver/memburn
+cp /in/memburn-init $ver/memburn-init
 cp /in/memburn.exe $tree/windows/memburn.exe
 cp /usb/memburn.cfg.example $tree/memburn.cfg.example
 sed 's/$/\r/' /usb/README.txt > $tree/README.txt

@@ -6,7 +6,7 @@ Boot this stick from the PC's boot menu (often F8, F11 or F12). The GRUB menu of
 
 Keys: Enter quick check, F full memory test, B burn-in, S stress (Linux entry), A all repeating,
 Esc stop, Q larger QR code, R restart, P power off.
-With a network the menu offers U to update the stick when a newer signed release exists.
+With a network the stick installs a newer signed release after the run; U starts it right away.
 
 With a wired network the screen shows a QR code and a reljam.com link to follow the run from a phone.
 Results: on screen, in memburn.log, and per-run bit statistics in memburn-history.txt at this stick's root.

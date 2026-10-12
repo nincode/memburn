@@ -57,7 +57,7 @@ A wrong disk name erases that disk. Check the size in `lsblk` or `diskutil list`
 ## Use it
 
 1. Plug the stick in and open the PC's boot menu. The key depends on the board: often F8, F11 or F12, sometimes Esc or F10.
-2. Pick the USB stick. GRUB starts `memburn <version>` after 5 s.
+2. Pick the USB stick. GRUB starts `memburn <version>` after 5 s. Linux then tests memory for about 6 s per 16 GiB (`early_memtest=2`) while GRUB's text stays on screen.
 3. The menu starts the quick check after 10 s. Press Enter to start it now, or another key below.
 
 ![Menu](docs/img/menu.png)
@@ -76,7 +76,9 @@ A wrong disk name erases that disk. Check the size in `lsblk` or `diskutil list`
 | Esc | stop the run after the current step |
 | Q | larger QR code |
 | R / P | restart / power off, from the menu or result screen |
-| U | update the stick, shown only when a newer release exists |
+| U | update now, shown while a newer release downloads or waits |
+
+During memory tests the current-test panel shows the time left in the test and in the whole job, from the measured memory speed. The memory modules panel lists each module's slot, size, speed and part.
 
 The second GRUB entry, `bare-metal UEFI`, needs Secure Boot off. It tests a little more RAM but has no network and no stress mode.
 
@@ -111,11 +113,11 @@ The stick shows up as a normal drive on any PC. Its root holds:
 | `memburn.cfg.example` | rename to `memburn.cfg` for unattended runs |
 | `windows\memburn.exe` | the Windows version |
 
-`memburn.cfg` skips the menu and runs one job. Keys: `mode=quick|mem|burn|both|stress|cores`, `minutes=`, `cycles=` (0 = until Esc), `shutdown=1`, `upload=0`, `update=auto`. The example file lists them all.
+`memburn.cfg` skips the menu and runs one job. Keys: `mode=quick|mem|burn|both|stress|cores`, `minutes=`, `cycles=` (0 = until Esc), `shutdown=1`, `upload=0`, `update=auto|off`. The example file lists them all.
 
 ### Updates
 
-With a network the stick checks for a newer release at start. When one exists, the menu shows `U  Update to <version>`. U downloads it, checks its signature and every file's hash, and restarts. The previous version stays in the GRUB menu as `memburn <old> (previous)`. Your `memburn.cfg`, log and history are kept. Without U the countdown runs the quick check as usual.
+The stick checks for a newer release in the background, as soon as the network is up. It downloads it and checks its signature and every file's hash during the run, without delaying the menu or the test, and installs it after the run: the result screen says `Updated to <version>, used at the next boot`. U (or `update=auto`) starts the new version as soon as it checks out, restarting the test. The previous version stays in the GRUB menu as `memburn <old> (previous)`. Your `memburn.cfg`, log and history are kept. `update=off` turns the check off.
 
 ### Privacy
 

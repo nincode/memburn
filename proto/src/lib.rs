@@ -330,13 +330,26 @@ fn current(c: &TuiCurrent) -> Current {
             lines: rows.iter().map(|(l, v)| format!("{l}: {v}")).collect(),
             progress: None,
         },
-        TuiCurrent::Mem { test, pass, passes, index, count, step, steps, done, total, left_ms } => Current {
+        TuiCurrent::Mem {
+            test,
+            pass,
+            passes,
+            index,
+            count,
+            step,
+            steps,
+            done,
+            total,
+            left_ms,
+            job_left_ms,
+            job_label,
+        } => Current {
             kind: Phase::Mem,
             title: test.name().into(),
             lines: vec![
                 format!("pass {pass}/{passes} · test {index}/{count} · step {step}/{steps}"),
                 format!("{:.1} / {:.1} GiB", *done as f64 / (1u64 << 30) as f64, *total as f64 / (1u64 << 30) as f64),
-                left_ms.map_or("estimating".into(), |ms| format!("~{} left", tui::clock(ms))),
+                tui::time_left(*left_ms, *job_left_ms, job_label).replace("  ·  ", " · "),
             ],
             progress: Some((done * 100).checked_div(*total).unwrap_or(0) as u8),
         },

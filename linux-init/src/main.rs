@@ -29,6 +29,11 @@ mod linux {
     /// memburn exit codes for the Restart and Power off keys.
     const EXIT_RESTART: i32 = 10;
     const EXIT_POWER_OFF: i32 = 11;
+    /// memburn left a new binary at NEXT and extra arguments, one per line, at NEXT_ARGS.
+    const EXIT_REEXEC: i32 = 12;
+    const NEXT: &str = "/memburn-next";
+    const NEXT_ARGS: &str = "/memburn-next.args";
+    const MEMBURN: &str = "/bin/memburn";
     /// MemAvailable less this is tested; the rest keeps the kernel out of OOM.
     const DEFAULT_MEM: &str = "-384M";
     const SECURE_BOOT_VAR: &str = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
@@ -75,6 +80,7 @@ mod linux {
         let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
         let header = format!("memburn USB stick  |  Linux {}  |  Secure Boot: {}", kernel_release(), secure_boot());
         say(&header);
+        say("Loading drivers...");
         let failed = load_modules();
         if !failed.is_empty() {
             warn(&format!("Drivers that did not load: {}", failed.join(", ")));
@@ -116,25 +122,43 @@ mod linux {
         }
         let mut unattended = cfg.map(|text| translate(&text, crash_log.is_none()));
         let mut crash_log = crash_log;
+        let mut bin = MEMBURN;
+        let mut again: Option<(Vec<String>, bool)> = None;
+        let mut extra: Vec<String> = Vec::new();
         loop {
-            let (mut args, shutdown) =
-                unattended.take().unwrap_or_else(|| (vec!["--mem".into(), DEFAULT_MEM.into()], false));
-            if shutdown {
-                args.push("--exit-when-done".into());
-            }
-            if let Some(name) = crash_log.take() {
-                args.extend(["--crash-log".into(), name]);
-            }
-            for t in &tags {
-                args.extend(["--tag".into(), t.clone()]);
-            }
-            match run_memburn(&args, stick, &header) {
-                Some(EXIT_RESTART) => finish(libc::RB_AUTOBOOT),
+            let (args, shutdown) = again.take().unwrap_or_else(|| {
+                let (mut args, shutdown) =
+                    unattended.take().unwrap_or_else(|| (vec!["--mem".into(), DEFAULT_MEM.into()], false));
+                if shutdown {
+                    args.push("--exit-when-done".into());
+                }
+                if let Some(name) = crash_log.take() {
+                    args.extend(["--crash-log".into(), name]);
+                }
+                for t in &tags {
+                    args.extend(["--tag".into(), t.clone()]);
+                }
+                (args, shutdown)
+            });
+            let mut full = args.clone();
+            full.append(&mut extra);
+            match run_memburn(bin, &full, stick, &header) {
+                Some(EXIT_REEXEC) if Path::new(NEXT).exists() => {
+                    bin = NEXT;
+                    extra = fs::read_to_string(NEXT_ARGS).unwrap_or_default().lines().map(String::from).collect();
+                    again = Some((without_crash_log(args), shutdown));
+                }
+                Some(EXIT_REEXEC | EXIT_RESTART) => finish(libc::RB_AUTOBOOT),
                 Some(EXIT_POWER_OFF) => finish(libc::RB_POWER_OFF),
                 _ if shutdown => finish(libc::RB_POWER_OFF),
                 Some(2) => {
                     warn("memburn.cfg has a bad setting (see the message above); starting the menu in 15 s.");
                     std::thread::sleep(Duration::from_secs(15));
+                }
+                None if bin == NEXT => {
+                    warn("The updated memburn crashed or could not be started; starting the booted one in 5 s.");
+                    bin = MEMBURN;
+                    std::thread::sleep(Duration::from_secs(5));
                 }
                 None => {
                     warn("memburn crashed or could not be started; restarting it in 5 s.");
@@ -394,7 +418,7 @@ mod linux {
         // Part 1 of a dump is its end; higher parts are older.
         records.sort_by(|a, b| b.0.cmp(&a.0));
         let newest = records.iter().map(|r| r.2).max().unwrap_or(0);
-        let stamp = memburn_core::history::date(newest);
+        let stamp = date(newest);
         let mut text = format!("memburn kernel crash log, {stamp}\r\n");
         for (name, data, _) in &records {
             text.push_str(&format!("\r\n== {name} ==\r\n"));
@@ -413,6 +437,37 @@ mod linux {
             let _ = fs::remove_file(Path::new(PSTORE).join(rec));
         }
         Some(name)
+    }
+
+    /// "2026-10-12 11:02 UTC" from Unix seconds.
+    pub(super) fn date(unix: u64) -> String {
+        let days = (unix / 86_400) as i64;
+        let (h, m) = (unix / 3600 % 24, unix / 60 % 60);
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(mo <= 2);
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02} UTC")
+    }
+
+    /// `args` without `--crash-log NAME`, which is for the first start only.
+    pub(super) fn without_crash_log(args: Vec<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut it = args.into_iter();
+        while let Some(a) = it.next() {
+            if a == "--crash-log" {
+                it.next();
+            } else {
+                out.push(a);
+            }
+        }
+        out
     }
 
     /// "2026-10-12 11:02 UTC" -> "memburn-crash-2026-10-12-1102".
@@ -471,7 +526,7 @@ mod linux {
                 "update" => {
                     match v.as_str() {
                         "auto" => args.push("--update-auto".into()),
-                        "off" => {}
+                        "off" => args.push("--no-update".into()),
                         _ => warn(&format!("memburn.cfg: update={v} (expected auto or off)")),
                     }
                     continue;
@@ -501,8 +556,8 @@ mod linux {
         (args, shutdown)
     }
 
-    fn run_memburn(args: &[String], stick: bool, header: &str) -> Option<i32> {
-        let mut cmd = Command::new("/bin/memburn");
+    fn run_memburn(bin: &str, args: &[String], stick: bool, header: &str) -> Option<i32> {
+        let mut cmd = Command::new(bin);
         cmd.args(["--boot"]).args(args);
         if stick {
             cmd.args(["--stick", STICK]);
@@ -539,7 +594,7 @@ mod linux {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::linux::{crash_file_name, is_jc42, is_spd5118, translate};
+    use super::linux::{crash_file_name, date, is_jc42, is_spd5118, translate, without_crash_log};
 
     #[test]
     fn sensor_id_checks() {
@@ -561,5 +616,15 @@ mod tests {
         let (args, _) = translate("server=http://127.0.0.1:3010\nupdate=auto\n", true);
         assert!(args.windows(2).any(|w| w == ["--server", "http://127.0.0.1:3010"]), "{args:?}");
         assert!(args.iter().any(|a| a == "--update-auto"), "{args:?}");
+        let (args, _) = translate("update=off\n", true);
+        assert!(args.iter().any(|a| a == "--no-update"), "{args:?}");
+    }
+
+    #[test]
+    fn dates_and_restart_arguments() {
+        assert_eq!(date(1_791_802_920), "2026-10-12 11:02 UTC");
+        assert_eq!(date(0), "1970-01-01 00:00 UTC");
+        let args: Vec<String> = ["--mode", "quick", "--crash-log", "x.txt", "--tag", "t"].map(String::from).into();
+        assert_eq!(without_crash_log(args), ["--mode", "quick", "--tag", "t"]);
     }
 }

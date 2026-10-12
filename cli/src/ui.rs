@@ -1,6 +1,7 @@
 //! Output for a run: the full-screen dashboard on a terminal, plain lines otherwise; both feed the log and the uploader.
 
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use memburn_proto::Snapshot;
 
 use crate::os;
 use crate::term::{Key, Term};
+use crate::update::{State, Updater};
 use crate::upload::Uploader;
 
 const DRAW_EVERY: Duration = Duration::from_millis(200);
@@ -62,6 +64,11 @@ pub struct Ui {
     finished: bool,
     url_shown: bool,
     stop: &'static AtomicBool,
+    /// The stick's update; U opts in, and a run stops once an opted-in update is ready.
+    pub updater: Option<Arc<Updater>>,
+    update_said: String,
+    /// Footer labels for the update key, made once per version: (version, offer, opted in, installed).
+    update_keys: Option<(String, [&'static str; 3])>,
 }
 
 impl Ui {
@@ -96,6 +103,9 @@ impl Ui {
             finished: false,
             url_shown: false,
             stop,
+            updater: None,
+            update_said: String::new(),
+            update_keys: None,
         }
     }
 
@@ -293,6 +303,7 @@ impl Ui {
             self.peak_ram_temp = self.peak_ram_temp.max(self.view.perf.ram_temp_c);
         }
         self.remote();
+        self.sync_update();
         if self.view.verdict == Verdict::Running && self.stop.load(Ordering::Relaxed) {
             self.view.verdict = Verdict::Stopping;
         }
@@ -319,6 +330,12 @@ impl Ui {
                         self.view.verdict = Verdict::Stopping;
                         self.drawn = None;
                     }
+                    Key::Char('U') if self.updater.as_ref().is_some_and(|u| u.offer().is_some() && !u.opted()) => {
+                        if let Some(u) = &self.updater {
+                            u.opt_in();
+                        }
+                        self.drawn = None;
+                    }
                     Key::Char('Q') if self.view.remote.as_ref().is_some_and(|r| r.qr.is_some()) => {
                         self.view.qr_zoom = !self.view.qr_zoom;
                         self.drawn = None;
@@ -328,6 +345,46 @@ impl Ui {
             }
         }
         other
+    }
+
+    /// Logs the update's progress once per step, keeps the U key in the footer while one is on offer, and stops
+    /// a run once an opted-in update is ready.
+    fn sync_update(&mut self) {
+        let Some(u) = self.updater.clone() else { return };
+        let said = match u.state() {
+            State::Rejected(e) => format!("Update check: rejected, {e}"),
+            State::NoSpace(v) => format!("Update available: {v}, too little space on the stick: re-flash needed"),
+            State::Staging { version, .. } => format!("Update available: {version}, downloading"),
+            State::Ready(s) => format!("Update {}: downloaded and checked", s.version),
+            State::Failed { version, error } => format!("Update to {version} failed: {error}"),
+            _ => String::new(),
+        };
+        if !said.is_empty() && said != self.update_said {
+            self.line(&said);
+            self.flush_log();
+            self.update_said = said;
+        }
+        self.view.keys.retain(|k| k.0 != "U");
+        if let Some(v) = u.offer()
+            && !matches!(self.view.verdict, Verdict::Menu(_))
+        {
+            if self.update_keys.as_ref().is_none_or(|k| k.0 != v) {
+                let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+                let labels = [format!("update to {v}"), format!("updating to {v}"), format!("start {v}")].map(leak);
+                self.update_keys = Some((v.clone(), labels));
+            }
+            if let Some((_, labels)) = &self.update_keys {
+                let k = match u.state() {
+                    _ if u.opted() => 1,
+                    State::Installed { .. } => 2,
+                    _ => 0,
+                };
+                self.view.keys.insert(0, ("U", labels[k]));
+            }
+        }
+        if self.view.verdict == Verdict::Running && u.due() {
+            self.stop.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Waits up to `wait` for a key, drawing meanwhile.
