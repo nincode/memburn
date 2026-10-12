@@ -124,6 +124,9 @@ pub struct ErrRow {
     /// Test key, e.g. "mi8".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test: Option<String>,
+    /// Likely module or channel, e.g. "DIMM_B2".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -144,6 +147,7 @@ impl ErrRow {
             space: m.map(|m| if m.phys { Space::Phys } else { Space::Virt }),
             addr: m.map(|m| m.addr),
             test: m.map(|m| TestId::from_u8(m.test).map_or("?", |t| t.key()).into()),
+            module: e.module.clone(),
         }
     }
 }
@@ -188,6 +192,13 @@ pub struct Dimm {
     pub manufacturer: String,
     pub part: String,
     pub serial: String,
+    /// Errors decode to this module or its channel.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub likely: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A flipped bit: flips each way, distinct failing addresses, earlier runs in which it failed.
@@ -298,7 +309,8 @@ impl Snapshot {
             dimms: v
                 .dimms
                 .iter()
-                .map(|d| Dimm {
+                .enumerate()
+                .map(|(n, d)| Dimm {
                     locator: d.locator.clone(),
                     bank: d.bank.clone(),
                     size_mib: d.size_mib,
@@ -307,6 +319,7 @@ impl Snapshot {
                     manufacturer: d.manufacturer.clone(),
                     part: d.part.clone(),
                     serial: d.serial.clone(),
+                    likely: v.suspects.iter().any(|s| s.dimms.contains(&n)),
                 })
                 .collect(),
             finished: None,
@@ -443,6 +456,14 @@ mod tests {
         let back: Snapshot = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.dimms, s.dimms);
         assert_eq!((back.dimms[0].size_mib, back.dimms[0].serial.as_str()), (16384, "1A2B"));
+        assert!(!back.dimms[0].likely && !serde_json::to_string(&s).unwrap().contains("likely"));
+        v.suspects = vec![tui::Suspect { label: "DIMM_A1".into(), errors: 1, dimms: vec![0] }];
+        let e = MemError { addr: 0x10, expected: 0, actual: 1, test: 0, pass: 0 };
+        v.errors = vec![tui::ErrLine { module: "DIMM_A1".into(), ..tui::ErrLine::mem(1, &e, Some(0x10)) }];
+        let s = Snapshot::from_view(&v);
+        let back: Snapshot = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.dimms[0].likely);
+        assert_eq!(back.errors[0].module, "DIMM_A1");
     }
 
     #[test]

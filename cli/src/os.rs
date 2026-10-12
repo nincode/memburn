@@ -233,6 +233,23 @@ pub fn system_ram() -> Option<Ranges> {
     None
 }
 
+/// A config-space dword of PCI device 0000:00:`dev`.`func`; extended registers need root.
+pub fn pci_config(dev: u8, func: u8, off: u16) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(format!("/sys/bus/pci/devices/0000:00:{dev:02x}.{func}/config")).ok()?;
+        let mut b = [0u8; 4];
+        f.read_exact_at(&mut b, u64::from(off)).ok()?;
+        Some(u32::from_le_bytes(b))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dev, func, off);
+        None
+    }
+}
+
 /// The kernel log as `/dev/kmsg` records, empty when unreadable.
 pub fn kernel_log() -> String {
     #[cfg(target_os = "linux")]

@@ -14,6 +14,7 @@ use clap::{Parser, ValueEnum};
 use memburn_core::coverage::{self, EarlyTest, Footprint, Ranges};
 use memburn_core::cpu::{self, Isa};
 use memburn_core::cycler;
+use memburn_core::dram;
 use memburn_core::engine::{Moved, PhaseJob, chunk_bytes, chunk_regions};
 use memburn_core::errlog::{self, BitList, ErrorLog};
 use memburn_core::eta::{self, Rate, Shown};
@@ -327,6 +328,12 @@ fn run(args: &Args) -> Result<u8, String> {
     for d in &out.view.dimms.clone() {
         out.line(&format!("Memory module: {}", d.line()));
     }
+    let dump = dram::Dump::read(cpu::cpuid(1, 0).0, os::pci_config);
+    let (map, lines) = dram::setup(&dump, &out.view.dimms);
+    out.view.dram = map;
+    for l in lines {
+        out.line(&l);
+    }
     out.flush_log();
     if !args.no_upload {
         out.upload(args.server.trim_end_matches('/').to_string());
@@ -626,12 +633,10 @@ fn run_job(c: &mut Ctx, job: &Job) -> Result<u8, String> {
             },
         );
         for &r in &e.bad {
-            v.errors.push(ErrLine {
-                at_ms: 0,
-                kind: ErrKind::Mem,
-                text: format!("early: bad memory {}, reserved by the kernel", coverage::fmt_range(r)),
-                mem: None,
-            });
+            let module = v.suspect_range(r.0, r.1).unwrap_or_default();
+            let text = format!("early: bad memory {}, reserved by the kernel", coverage::fmt_range(r));
+            let text = if module.is_empty() { text } else { format!("{text}  {module}") };
+            v.errors.push(ErrLine { at_ms: 0, kind: ErrKind::Mem, text, mem: None, module });
         }
         v.mem_errors = errors;
         c.out.extra_mem = errors;
@@ -767,7 +772,7 @@ fn summary(c: &mut Ctx, job: &Job) -> u8 {
         append_history(c, &history::end_line(&date, burn_errors));
     }
     if mem_errors > 0 {
-        c.out.line(&format!("  Find the stick: {}", tui::locate(c.log.bits())));
+        c.out.line(&format!("  Find the stick: {}", tui::find_stick(&c.out.view.suspects, c.log.bits())));
     }
     let temps: Vec<(&str, i32)> = [("CPU", c.out.peak_temp), ("RAM", c.out.peak_ram_temp)]
         .into_iter()
@@ -782,7 +787,7 @@ fn summary(c: &mut Ctx, job: &Job) -> u8 {
     }
     rows.push(("Total time".into(), total.clone()));
     rows.extend(install_update(c));
-    rows.extend(tui::module_rows(&c.out.view.dimms, c.log.bits()));
+    rows.extend(tui::module_rows(&c.out.view.dimms, &c.out.view.suspects, c.log.bits()));
     let advice = if mem_errors + burn_errors > 0 || stopped {
         errlog::advice(mem_errors, burn_errors).to_string()
     } else {

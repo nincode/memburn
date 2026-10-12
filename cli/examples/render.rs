@@ -1,6 +1,7 @@
 //! Writes dashboard scenes as cell dumps (chars, fg, bg rows) for UI review renders.
 use std::fmt::Write as _;
 
+use memburn_core::dram::{self, Dump};
 use memburn_core::errlog::MemError;
 use memburn_core::fft::{BurnError, Fault};
 use memburn_core::memtest::TestId;
@@ -203,7 +204,7 @@ pub fn scenes() -> Vec<(&'static str, usize, usize, View)> {
     errors.push(ErrLine::cpu(97_000, &cpu));
     v.errors = errors;
     if let Current::Summary(rows) = &mut v.current {
-        rows.extend(tui::module_rows(&v.dimms, 1 << 17 | 1 << 3));
+        rows.extend(tui::module_rows(&v.dimms, &[], 1 << 17 | 1 << 3));
     }
     v.advice = "Reset CPU and memory to stock, check cooling, then retest memory one stick at a time.".into();
     v.keys = vec![
@@ -279,8 +280,43 @@ pub fn scenes() -> Vec<(&'static str, usize, usize, View)> {
         }
         out.push((name, w, h, v));
     }
+
+    let two: Vec<Dimm> = ["A2", "B2"]
+        .map(|slot| Dimm {
+            locator: format!("DIMM_{slot}"),
+            bank: format!("P0 CHANNEL {}", &slot[..1]),
+            size_mib: 16384,
+            speed: 3200,
+            configured: 3200,
+            part: "F4-3200C16-16GSXKB".into(),
+            ..Dimm::default()
+        })
+        .to_vec();
+    let map = Dump::parse(ZEN3_A2_B2).unwrap();
+    for (name, w, h) in [("9-likely-module-100x31", 100, 31), ("9-likely-module-160x50", 160, 50)] {
+        let mut v = base(
+            Verdict::Running,
+            quick_plan([Done { ms: 4000, errors: 2 }, Running, Pending, Pending]),
+            mem_test(TestId::MovingInvWalk8, 2, 9, 24, 37),
+        );
+        v.dimms = two.clone();
+        v.dram = dram::setup(&map, &v.dimms).0;
+        v.elapsed_ms = 19_000;
+        v.perf.mem = mem_series(120);
+        v.mem_errors = 3;
+        v.bits = vec![BitStat { bit: 35, up: 0, down: 3, places: 2, runs: 0 }];
+        for (t, a) in [(3_100, 0x7_fdf5_04c8u64), (9_800, 0x7_fdf5_04c8), (15_200, 0x7_fdf5_14c8)] {
+            v.push_mem(t, &mem_err(a as usize, u64::MAX, 35, TestId::MovingInvOnes), Some(a));
+        }
+        out.push((name, w, h, v));
+    }
     out
 }
+
+/// A Zen 3 desktop DRAM map: 32 GiB on two channels, hashed at bit 8, MMIO hole at 3 GiB.
+const ZEN3_A2_B2: &str = "cpuid 00a20f10 18.0:000=14401022 18.0:040=00000010 18.0:104=c0000003 18.0:110=00000033 \
+    18.0:114=00083000 18.0:118=00000000 18.0:11c=00000000 18.0:1b4=00000000 18.0:3f8=00700000 18.1:150=00000000 \
+    18.1:208=0300003f 18.1:20c=00000008 19.0:000=ffffffff";
 
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "target/renders".into());

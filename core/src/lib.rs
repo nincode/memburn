@@ -6,6 +6,7 @@ extern crate alloc;
 pub mod coverage;
 pub mod cpu;
 pub mod cycler;
+pub mod dram;
 pub mod engine;
 pub mod errlog;
 pub mod eta;

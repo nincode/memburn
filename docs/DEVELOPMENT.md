@@ -50,7 +50,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-6-0` for 0.6.0 |
+| Volume label | `MB 0-6-1` for 0.6.1 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |
@@ -131,7 +131,19 @@ data bytes of a 64-bit channel.
 
 The log, the summary and the live view list the memory modules from SMBIOS: slot, size, rated and
 running speed, maker, part number and serial. Under Linux this needs root (the stick); Windows and
-UEFI always have it. The address alone does not name the module; the swap test in the README does.
+UEFI always have it.
+
+`core/src/dram.rs` names the likely module on single-node AMD Data Fabric 2 and 3 (Zen to Zen 3).
+It reads the DRAM address maps from PCI config of 00:18.0/1 (sysfs on Linux, the root bridge
+protocol on UEFI), applies the channel hash, and maps the channel (UMC n = letter A+n) to the SMBIOS
+locator. With one module per channel it names the slot, with more it says "channel X"; it does not
+decode chip selects. It refuses on DF3.5 and later, multi-node, die or socket interleave, unknown modes,
+a size mismatch with SMBIOS and channel letters that disagree with the map; Intel, VMs, QEMU and
+Windows fall back to no hint.
+memburn.log holds the raw registers once per boot (`DRAM map registers: cpuid ... 18.0:110=...`)
+and the result (`DRAM map: Df3, channels A, B` or `DRAM map: not decoded, <reason>`).
+`Dump::parse` reads that line back, so a user's log becomes a unit test. The hint shows in error
+lines, the errors table of the live view, the summary, the modules panel and the "Find the stick" line.
 
 ## Run history
 

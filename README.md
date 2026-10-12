@@ -13,7 +13,7 @@ Download the stick image from [Releases](https://github.com/nincode/memburn/rele
 ![Quick check running on the stick](docs/img/quick-check.png)
 
 <p>
-<img src="docs/img/result-errors.png" alt="FAIL result with the bit table" width="70%">
+<img src="docs/img/bg-failing-run.webp" alt="Photo of a failing run on a Ryzen 9 5950X with four DDR4 modules: 39 flipped bits in two places" width="70%">
 <img src="docs/img/live-phone.png" alt="Live view on a phone" width="27%">
 </p>
 
@@ -91,6 +91,8 @@ The second GRUB entry, `bare-metal UEFI`, needs Secure Boot off. It tests a litt
 | STOPPED EARLY (brown) | Esc before the end, no errors so far. |
 
 Each error shows the time, the flipped bit, its direction (0->1 or 1->0), the physical address and the test. The top of the errors panel sums up each bit: lane, how often it flipped each way, at how many addresses. The same bit at many addresses points to timing or voltage. One address points to a bad cell.
+
+On single-socket AMD Ryzen and EPYC (Zen to Zen 3) memburn reads the memory controller's address map and names the likely module, or the channel when a channel holds two modules. Elsewhere it names none; use the swap test.
 
 **On memory errors**
 

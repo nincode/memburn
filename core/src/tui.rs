@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::dram::{Hint, Modules};
 use crate::errlog::{ErrorLog, MemError};
 use crate::fft::{BurnError, Fault};
 use crate::history::History;
@@ -292,6 +293,17 @@ pub struct ErrLine {
     pub text: String,
     /// Fields of a memory error.
     pub mem: Option<MemAt>,
+    /// Likely module or channel, e.g. "DIMM_B2"; empty when unknown.
+    pub module: String,
+}
+
+/// A module or channel that errors decode to, with their count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suspect {
+    pub label: String,
+    pub errors: u64,
+    /// Indices into [`View::dimms`].
+    pub dimms: Vec<usize>,
 }
 
 /// A memory error's flipped bits, address and test.
@@ -326,11 +338,17 @@ impl MemAt {
 
 impl ErrLine {
     pub fn mem(at_ms: u64, e: &MemError, phys: Option<u64>) -> ErrLine {
-        ErrLine { at_ms, kind: ErrKind::Mem, text: mem_line(e, phys), mem: Some(MemAt::new(e, phys)) }
+        ErrLine {
+            at_ms,
+            kind: ErrKind::Mem,
+            text: mem_line(e, phys),
+            mem: Some(MemAt::new(e, phys)),
+            module: String::new(),
+        }
     }
 
     pub fn cpu(at_ms: u64, e: &BurnError) -> ErrLine {
-        ErrLine { at_ms, kind: ErrKind::Cpu, text: cpu_line(e), mem: None }
+        ErrLine { at_ms, kind: ErrKind::Cpu, text: cpu_line(e), mem: None, module: String::new() }
     }
 }
 
@@ -353,6 +371,10 @@ pub struct View {
     pub system: Vec<String>,
     /// Memory modules from SMBIOS.
     pub dimms: Vec<Dimm>,
+    /// DRAM address map matched to [`View::dimms`]; None where it cannot be read or checked.
+    pub dram: Option<Modules>,
+    /// Modules or channels the errors decode to, in order of first error.
+    pub suspects: Vec<Suspect>,
     pub elapsed_ms: u64,
     pub verdict: Verdict,
     /// Name of the run, e.g. "Quick check".
@@ -381,6 +403,8 @@ impl Default for View {
             version: "",
             system: Vec::new(),
             dimms: Vec::new(),
+            dram: None,
+            suspects: Vec::new(),
             elapsed_ms: 0,
             verdict: Verdict::Running,
             job: String::new(),
@@ -397,6 +421,43 @@ impl Default for View {
             qr_zoom: false,
             notice: String::new(),
         }
+    }
+}
+
+impl View {
+    /// Adds a memory error line; returns the likely module or channel when the DRAM map names one.
+    pub fn push_mem(&mut self, at_ms: u64, e: &MemError, phys: Option<u64>) -> Option<String> {
+        let hint: Option<Hint> = phys.and_then(|p| self.dram.as_ref()?.hint(p, &self.dimms));
+        let mut line = ErrLine::mem(at_ms, e, phys);
+        if let Some(h) = &hint {
+            line.text = format!("{}  {}", line.text, h.label);
+            line.module = h.label.clone();
+            self.suspect(h);
+        }
+        self.errors.push(line);
+        hint.map(|h| h.label)
+    }
+
+    /// The likely module of a bad physical range `start..end`, counted as one error, when both ends agree.
+    pub fn suspect_range(&mut self, start: u64, end: u64) -> Option<String> {
+        let m = self.dram.as_ref()?;
+        let last = m.hint(end.checked_sub(1)?, &self.dimms);
+        let h = m.hint(start, &self.dimms).filter(|h| last.as_ref() == Some(h))?;
+        self.suspect(&h);
+        Some(h.label)
+    }
+
+    fn suspect(&mut self, h: &Hint) {
+        match self.suspects.iter_mut().find(|s| s.label == h.label) {
+            Some(s) => s.errors += 1,
+            None => self.suspects.push(Suspect { label: h.label.clone(), errors: 1, dimms: h.dimms.clone() }),
+        }
+    }
+
+    /// Clears the errors of the previous run.
+    pub fn clear_errors(&mut self) {
+        self.errors.clear();
+        self.suspects.clear();
     }
 }
 
@@ -828,7 +889,8 @@ fn modules(v: &View, f: &mut Frame, r: Rect) {
             (_, c) => format!("{c} MT/s"),
         };
         let size = crate::smbios::size(d.size_mib);
-        let x = f.text(i.x, i.y + n, &format!("{s:<sw$}"), i.w, White, Black);
+        let likely = v.suspects.iter().any(|x| x.dimms.contains(&n));
+        let x = f.text(i.x, i.y + n, &format!("{s:<sw$}"), i.w, if likely { LightRed } else { White }, Black);
         let x = f.text(
             x + 2,
             i.y + n,
@@ -837,6 +899,11 @@ fn modules(v: &View, f: &mut Frame, r: Rect) {
             LightGray,
             Black,
         );
+        let x = if likely {
+            f.text(x + 2, i.y + n, "likely", (i.x + i.w).saturating_sub(x + 2), LightRed, Black)
+        } else {
+            x
+        };
         f.text(x + 2, i.y + n, &d.part, (i.x + i.w).saturating_sub(x + 2), DarkGray, Black);
     }
     if more > 0 {
@@ -925,9 +992,26 @@ pub fn cpu_line(e: &BurnError) -> String {
 }
 
 /// Summary rows: how to find the faulty stick when bits in `flipped` failed, then one per memory module.
-pub fn module_rows(dimms: &[Dimm], flipped: u64) -> Vec<(String, String)> {
-    let locate = (flipped != 0).then(|| (String::from("Find the stick"), locate(flipped)));
-    locate.into_iter().chain(dimms.iter().map(|d| (String::from("Module"), d.line()))).collect()
+pub fn module_rows(dimms: &[Dimm], suspects: &[Suspect], flipped: u64) -> Vec<(String, String)> {
+    let find = (flipped != 0).then(|| (String::from("Find the stick"), find_stick(suspects, flipped)));
+    find.into_iter().chain(dimms.iter().map(|d| (String::from("Module"), d.line()))).collect()
+}
+
+/// "likely DIMM_B2" from the DRAM map, most errors first; else the swap advice of [`locate`].
+pub fn find_stick(suspects: &[Suspect], flipped: u64) -> String {
+    let mut s: Vec<&Suspect> = suspects.iter().collect();
+    s.sort_by_key(|x| core::cmp::Reverse(x.errors));
+    match s.as_slice() {
+        [] => locate(flipped),
+        [one] => format!("likely {}", one.label),
+        many => {
+            let parts: Vec<String> = many
+                .iter()
+                .map(|x| format!("{} ({} error{})", x.label, x.errors, crate::errlog::plural(x.errors)))
+                .collect();
+            format!("likely {}", parts.join(", "))
+        }
+    }
 }
 
 /// "swap two, retest; lanes 0, 2": errors that move with a stick mark it; lanes are bit/8.
@@ -987,6 +1071,8 @@ mod tests {
             version: "0.2.0",
             system: vec![String::from("Test CPU"), String::from("4 threads")],
             dimms: vec![],
+            dram: None,
+            suspects: vec![],
             elapsed_ms: 61_000,
             verdict: Verdict::Running,
             job: String::from("Quick check"),
@@ -1017,7 +1103,13 @@ mod tests {
             cpu_errors: 1,
             bits: vec![BitStat { bit: 17, up: 4, down: 0, places: 2, runs: 1 }],
             errors: (0..30)
-                .map(|k| ErrLine { at_ms: k * 1000, kind: ErrKind::Mem, text: format!("e{k}"), mem: None })
+                .map(|k| ErrLine {
+                    at_ms: k * 1000,
+                    kind: ErrKind::Mem,
+                    text: format!("e{k}"),
+                    mem: None,
+                    module: String::new(),
+                })
                 .collect(),
             advice: String::new(),
             remote: Some(Remote {
@@ -1072,16 +1164,48 @@ mod tests {
     }
 
     #[test]
+    fn errors_name_the_likely_module() {
+        use crate::dram::{Df, Modules, tests as d};
+        let mut v = sample();
+        v.clear_errors();
+        v.dimms = d::four();
+        v.dram = Some(Modules::new(Df::parse(&d::bg(0xC, 0, d::ALL_HASH, 64)).unwrap(), &v.dimms).unwrap());
+        let e = MemError { addr: 0, expected: 0, actual: 1 << 20, test: 2, pass: 0 };
+        assert_eq!(v.push_mem(0, &e, Some(0xabd16f218)).as_deref(), Some("channel A"));
+        assert_eq!(v.push_mem(1, &e, Some(0xabd168348)).as_deref(), Some("channel A"));
+        assert_eq!(v.push_mem(2, &e, None), None);
+        assert_eq!(v.suspect_range(0xabd16f000, 0xabd16f040).as_deref(), Some("channel A"));
+        assert_eq!(v.suspect_range(0xabd16f000, 0xabd170000), None);
+        v.suspects[0].errors -= 1;
+        assert_eq!(v.errors[0].text, "bit 20 0->1  phys 0xabd16f218  mi8  channel A");
+        assert_eq!(v.suspects, vec![Suspect { label: "channel A".into(), errors: 2, dimms: vec![0, 1] }]);
+        let mut f = Frame::new(160, 50);
+        render(&v, &mut f);
+        let rows: Vec<String> = (0..f.h).map(|y| (0..f.w).map(|x| f.get(x, y).ch).collect()).collect();
+        assert!(rows.iter().any(|r| r.contains("DIMM_A1") && r.contains("likely")), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("DIMM_B1") && r.contains("likely")), "{rows:#?}");
+        v.clear_errors();
+        assert!(v.suspects.is_empty() && v.errors.is_empty());
+    }
+
+    #[test]
     fn module_rows_add_the_locate_row_on_errors() {
         let d = Dimm { locator: "A1".into(), size_mib: 8192, ..Dimm::default() };
         assert_eq!(
-            module_rows(core::slice::from_ref(&d), 0),
+            module_rows(core::slice::from_ref(&d), &[], 0),
             vec![(String::from("Module"), String::from("A1  8 GiB"))]
         );
-        let rows = module_rows(&[d], 1 << 17 | 1 << 3);
+        let rows = module_rows(core::slice::from_ref(&d), &[], 1 << 17 | 1 << 3);
         assert_eq!(rows[1].0, "Module");
         assert_eq!(rows[0].1, "swap two, retest; lanes 0, 2");
         assert_eq!(locate(1 << 63), "swap two, retest; lane 7");
+        let s = |label: &str, errors| Suspect { label: label.into(), errors, dimms: vec![0] };
+        let rows = module_rows(&[d], &[s("DIMM_B2", 3)], 1);
+        assert_eq!(rows[0].1, "likely DIMM_B2");
+        assert_eq!(
+            find_stick(&[s("channel A", 2), s("DIMM_B2", 37)], 1),
+            "likely DIMM_B2 (37 errors), channel A (2 errors)"
+        );
     }
 
     #[test]

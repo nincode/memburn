@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod config;
 mod gop;
+mod pci;
 mod ram;
 mod screen;
 mod smp;
@@ -21,6 +22,7 @@ use core::time::Duration;
 use memburn_core::coverage::{self, Footprint, Ranges};
 use memburn_core::cpu::{self, Isa};
 use memburn_core::cycler;
+use memburn_core::dram;
 use memburn_core::engine::{Chunk, Moved, PhaseJob, chunk_bytes, chunk_regions};
 use memburn_core::errlog::{self, BitList, ErrorLog, MemError};
 use memburn_core::eta::{self, Rate, Shown};
@@ -234,13 +236,13 @@ impl Ui {
             }
             for e in &mem[..n] {
                 let phys = Some(e.addr as u64);
+                self.places.add(e);
+                let likely = self.view.push_mem(at_ms, e, phys).map(|m| format!(", likely {m}")).unwrap_or_default();
                 self.screen.log(format!(
-                    "  MEMORY ERROR at {}: {e}, {} GiB from 0",
+                    "  MEMORY ERROR at {}: {e}, {} GiB from 0{likely}",
                     tui::at(e.addr, phys),
                     gib_frac(e.addr as u64)
                 ));
-                self.places.add(e);
-                self.view.errors.push(ErrLine::mem(at_ms, e, phys));
             }
             self.next_mem = next;
         }
@@ -341,6 +343,14 @@ fn main() -> Status {
     }
     for d in &ui.view.dimms {
         ui.screen.log(format!("Memory module: {}", d.line()));
+    }
+    let mut pci = pci::Config::open();
+    let dump = dram::Dump::read(cpu::cpuid(1, 0).0, |d, f, o| pci.as_mut()?.read(d, f, o));
+    drop(pci);
+    let (map, lines) = dram::setup(&dump, &ui.view.dimms);
+    ui.view.dram = map;
+    for l in lines {
+        ui.screen.log(l);
     }
     if let Some(u) = &ui.history.last_unfinished {
         ui.view.notice = format!("Previous run did not finish: {}, {}", u.job, u.date);
@@ -462,7 +472,7 @@ fn run_job(ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, plans: &[Plan], job: 
     v.mem_errors = 0;
     v.cpu_errors = 0;
     v.bits.clear();
-    v.errors.clear();
+    v.clear_errors();
     v.advice.clear();
     v.keys = vec![("Esc", "stop")];
     let repeat = match job.cycles {
@@ -575,7 +585,7 @@ fn summary(sh: &Shared, ui: &mut Ui, job: &Job) {
         ui.screen.log(format!("Could not update {}: {e}", history::FILE));
     }
     if mem_errors > 0 {
-        ui.screen.log(format!("  Find the stick: {}", tui::locate(sh.log.bits())));
+        ui.screen.log(format!("  Find the stick: {}", tui::find_stick(&ui.view.suspects, sh.log.bits())));
     }
     if let Some(t) = ui.peak_temp {
         ui.screen.log(format!("  Peak CPU temperature: {t} °C"));
@@ -595,7 +605,7 @@ fn summary(sh: &Shared, ui: &mut Ui, job: &Job) {
             Err(e) => format!("not saved: {e}"),
         },
     ));
-    rows.extend(tui::module_rows(&ui.view.dimms, sh.log.bits()));
+    rows.extend(tui::module_rows(&ui.view.dimms, &ui.view.suspects, sh.log.bits()));
     let v = &mut ui.view;
     v.verdict = verdict;
     v.current = Current::Summary(rows);

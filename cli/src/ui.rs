@@ -139,7 +139,7 @@ impl Ui {
         v.mem_errors = 0;
         v.cpu_errors = 0;
         v.bits.clear();
-        v.errors.clear();
+        v.clear_errors();
         v.advice.clear();
     }
 
@@ -218,15 +218,15 @@ impl Ui {
                 let off = e.addr.wrapping_sub(self.base) as f64 / (1u64 << 30) as f64;
                 let phys = os::phys(e.addr);
                 let virt = if phys.is_some() { format!(" ({})", tui::at(e.addr, None)) } else { String::new() };
+                self.places.add(e);
+                let likely = self.view.push_mem(at_ms, e, phys).map(|m| format!(", likely {m}")).unwrap_or_default();
                 self.styled(
                     Tone::Bad,
                     &format!(
-                        "  MEMORY ERROR at {}{virt}: {e}, {off:.3} GiB into the test buffer",
+                        "  MEMORY ERROR at {}{virt}: {e}, {off:.3} GiB into the test buffer{likely}",
                         tui::at(e.addr, phys)
                     ),
                 );
-                self.places.add(e);
-                self.view.errors.push(ErrLine::mem(at_ms, e, phys));
             }
             self.next_mem = next;
         }
