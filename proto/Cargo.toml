@@ -1,0 +1,12 @@
+[package]
+name = "memburn-proto"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+memburn-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = { version = "2", default-features = false }
+sha2 = { version = "0.10", default-features = false }

@@ -1,0 +1,14 @@
+# Rename to memburn.cfg at the stick's root to skip the menu and run unattended.
+mode=quick         # quick, mem, burn, both, cores, or stress (stress: Linux entry only)
+passes=1           # memory passes per cycle
+minutes=10         # burn-in or stress length, per CPU for cores (or seconds=N); unset: quick 2, both 10, burn 30, cores 2
+cycles=1           # 0 repeats until Esc
+fft=mixed          # small, large, mixed, or log2 sizes such as 12,16,20
+tests=addr,mi01,mi8,mirand,mi64,block,random,mod20,hash   # add fade (bit fade) or addrmove (address + block moves), or tests=all
+fade_secs=300
+# cpus=4           # use at most this many CPUs
+# mem_mib=1024     # test at most this much RAM
+early_memtest=2    # kernel memory test patterns before Linux starts (Linux entry); 0 turns it off
+upload=1           # 0 turns the live view off (Linux entry)
+# update=auto      # install a newer signed release before the run, then restart (Linux entry)
+shutdown=0         # 1 powers off when done

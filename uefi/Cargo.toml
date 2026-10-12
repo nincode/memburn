@@ -1,0 +1,9 @@
+[package]
+name = "memburn-uefi"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+[dependencies]
+memburn-core = { path = "../core" }
+uefi = { version = "0.41", features = ["alloc", "global_allocator", "panic_handler", "logger"] }

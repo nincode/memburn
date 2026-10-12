@@ -1,0 +1,8 @@
+[package]
+name = "memburn-core"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+[dependencies]
+libm = "0.2.16"
