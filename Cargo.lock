@@ -659,7 +659,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "memburn"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -675,14 +675,14 @@ dependencies = [
 
 [[package]]
 name = "memburn-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "memburn-init"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "memburn-core",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "memburn-proto"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ed25519-dalek",
  "memburn-core",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "memburn-uefi"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "memburn-core",
  "uefi",
