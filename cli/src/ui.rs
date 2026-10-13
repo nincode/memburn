@@ -14,9 +14,9 @@ use memburn_proto::Snapshot;
 use crate::os;
 use crate::term::{Key, Term};
 use crate::update::{State, Updater};
-use crate::upload::Uploader;
+use crate::upload::{Phase, Uploader};
 
-const DRAW_EVERY: Duration = Duration::from_millis(200);
+const DRAW_EVERY: Duration = Duration::from_millis(100);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const PUSH_EVERY: Duration = Duration::from_secs(3);
 const MAX_ERR_LINES: usize = 500;
@@ -32,6 +32,9 @@ pub enum Tone {
 pub struct Ui {
     pub view: View,
     term: Option<Term>,
+    /// The stick's framebuffers; the text dashboard draws when there are none.
+    #[cfg(target_os = "linux")]
+    pixels: Option<crate::fb::Pixels>,
     ansi: bool,
     tty: bool,
     status_len: usize,
@@ -77,6 +80,8 @@ impl Ui {
         Ui {
             view,
             term,
+            #[cfg(target_os = "linux")]
+            pixels: None,
             ansi: os::enable_ansi(),
             tty: std::io::stdout().is_terminal(),
             status_len: 0,
@@ -113,6 +118,27 @@ impl Ui {
         self.term.is_some()
     }
 
+    /// Draws the dashboard as pixels on the framebuffers from now on, when there are any.
+    pub fn pixels(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.term.is_some() {
+            self.pixels = crate::fb::Pixels::open();
+            if let Some(p) = &self.pixels {
+                let s = format!("Display: {}", p.describe());
+                self.line(&s);
+            }
+        }
+    }
+
+    /// Leaves full-screen output: framebuffers first, then the terminal.
+    fn close_screen(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.pixels = None;
+        }
+        self.term = None;
+    }
+
     pub fn upload(&mut self, server: String) {
         self.up = Some(Uploader::start(server.clone()));
         self.server = Some(server);
@@ -141,6 +167,7 @@ impl Ui {
         v.bits.clear();
         v.clear_errors();
         v.advice.clear();
+        v.map = None;
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -219,6 +246,9 @@ impl Ui {
                 let phys = os::phys(e.addr);
                 let virt = if phys.is_some() { format!(" ({})", tui::at(e.addr, None)) } else { String::new() };
                 self.places.add(e);
+                if let Some(m) = &mut self.view.map {
+                    m.error(e.addr as u64, phys.unwrap_or(e.addr as u64), e.expected ^ e.actual, at_ms);
+                }
                 let likely = self.view.push_mem(at_ms, e, phys).map(|m| format!(", likely {m}")).unwrap_or_default();
                 self.styled(
                     Tone::Bad,
@@ -314,15 +344,21 @@ impl Ui {
         if let Some(term) = &mut self.term {
             if due(self.drawn, DRAW_EVERY) {
                 self.drawn = Some(Instant::now());
-                let (w, h) = Term::size();
-                let mut f = Frame::new(w, h);
-                tui::render(&self.view, &mut f);
-                term.draw(f);
+                #[cfg(target_os = "linux")]
+                let drawn = self.pixels.as_mut().map(|p| p.draw(&self.view)).is_some();
+                #[cfg(not(target_os = "linux"))]
+                let drawn = false;
+                if !drawn {
+                    let (w, h) = Term::size();
+                    let mut f = Frame::new(w, h);
+                    tui::render(&self.view, &mut f);
+                    term.draw(f);
+                }
             }
             while let Some(k) = term.key(Duration::ZERO) {
                 match k {
                     Key::CtrlC if self.stop.load(Ordering::Relaxed) => {
-                        self.term = None;
+                        self.close_screen();
                         std::process::exit(130);
                     }
                     Key::Esc | Key::CtrlC if matches!(self.view.verdict, Verdict::Running | Verdict::Stopping) => {
@@ -338,6 +374,7 @@ impl Ui {
                     }
                     Key::Char('Q') if self.view.remote.as_ref().is_some_and(|r| r.qr.is_some()) => {
                         self.view.qr_zoom = !self.view.qr_zoom;
+                        sync_qr_key(&mut self.view);
                         self.drawn = None;
                     }
                     k => other = Some(k),
@@ -432,36 +469,36 @@ impl Ui {
     fn remote(&mut self) {
         let Some(up) = &self.up else { return };
         let st = up.state();
-        let Some(url) = st.url else {
-            self.view.remote = None;
-            return;
-        };
-        let status = match (st.done, &st.error, st.last_ok) {
-            (Some(true), ..) => String::from("uploaded"),
-            (Some(false), Some(e), _) => format!("upload failed  ·  {e}"),
-            (Some(false), None, _) => String::from("upload failed"),
-            (None, Some(e), _) => format!("offline  ·  {e}"),
-            (None, None, Some(t)) => format!("uploading  ·  {} s ago", t.elapsed().as_secs()),
-            (None, None, None) => String::from("connecting"),
+        let status = match (st.url.is_some(), st.done, &st.error, st.last_ok) {
+            (_, Some(true), ..) => String::from("uploaded"),
+            (_, Some(false), Some(e), _) => format!("upload failed  ·  {e}"),
+            (_, Some(false), None, _) => String::from("upload failed"),
+            (_, None, Some(e), _) => format!("offline  ·  {e}"),
+            (true, None, None, Some(t)) => format!("uploading  ·  {} s ago", t.elapsed().as_secs()),
+            (false, None, None, _) if st.phase == Phase::Waiting => String::from("waiting for network"),
+            _ => String::from("connecting"),
         };
         let ok = st.error.is_none() && st.done != Some(false);
+        let url = st.url.clone().unwrap_or_default();
         match &mut self.view.remote {
             Some(r) if r.url == url => {
                 r.status = status;
-                r.ok = ok;
+                r.ok = ok && !url.is_empty();
             }
-            r => *r = Some(Remote { qr: qr(&url), url: url.clone(), status, ok }),
+            r => *r = Some(Remote { qr: qr(&url), url: url.clone(), status, ok: ok && !url.is_empty() }),
         }
-        if !self.url_shown {
+        sync_qr_key(&mut self.view);
+        if !self.url_shown && !url.is_empty() {
             self.url_shown = true;
-            self.line(&format!("Live view: {url}"));
+            let after = st.created_after.map(|d| format!(", {:.1} s after the network came up", d.as_secs_f64()));
+            self.line(&format!("Live view: {url}{}", after.unwrap_or_default()));
         }
     }
 
     /// Sends the final snapshot unless sent, and restores the terminal.
     pub fn close(mut self) {
         self.finish();
-        self.term = None;
+        self.close_screen();
         if let Some(up) = self.up.take() {
             up.wait(Duration::from_secs(10));
         }
@@ -469,6 +506,9 @@ impl Ui {
 }
 
 fn qr(url: &str) -> Option<Qr> {
+    if url.is_empty() {
+        return None;
+    }
     let q = qrcodegen::QrCode::encode_text(url, qrcodegen::QrCodeEcc::Medium).ok()?;
     let n = q.size();
     Some(Qr { size: n as usize, dark: (0..n * n).map(|k| q.get_module(k % n, k / n)).collect() })
@@ -484,4 +524,21 @@ pub fn errors_word(n: u64) -> String {
 
 fn due(last: Option<Instant>, every: Duration) -> bool {
     last.is_none_or(|t| t.elapsed() >= every)
+}
+
+/// The Q key is listed once a QR code exists; its label says what it does next.
+fn sync_qr_key(v: &mut View) {
+    let has = v.remote.as_ref().is_some_and(|r| r.qr.is_some());
+    if !has {
+        v.qr_zoom = false;
+    }
+    let label = if v.qr_zoom { "smaller QR" } else { "bigger QR" };
+    match v.keys.iter().position(|k| k.0 == "Q") {
+        Some(i) if has => v.keys[i].1 = label,
+        Some(i) => {
+            v.keys.remove(i);
+        }
+        None if has && matches!(v.verdict, Verdict::Running | Verdict::Stopping) => v.keys.push(("Q", label)),
+        None => {}
+    }
 }

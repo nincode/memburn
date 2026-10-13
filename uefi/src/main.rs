@@ -31,7 +31,7 @@ use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
 use memburn_core::rng::splitmix64;
 use memburn_core::smbios;
-use memburn_core::tui::{self, Current, ErrLine, Perf, Places, Step, StepState, Verdict, View};
+use memburn_core::tui::{self, Current, ErrLine, MemMap, Perf, Places, Step, StepState, Verdict, View};
 use uefi::boot;
 use uefi::fs::FileSystem;
 use uefi::prelude::*;
@@ -237,6 +237,9 @@ impl Ui {
             for e in &mem[..n] {
                 let phys = Some(e.addr as u64);
                 self.places.add(e);
+                if let Some(m) = &mut self.view.map {
+                    m.error(e.addr as u64, e.addr as u64, e.expected ^ e.actual, at_ms);
+                }
                 let likely = self.view.push_mem(at_ms, e, phys).map(|m| format!(", likely {m}")).unwrap_or_default();
                 self.screen.log(format!(
                     "  MEMORY ERROR at {}: {e}, {} GiB from 0{likely}",
@@ -310,9 +313,10 @@ fn main() -> Status {
         current: Current::Busy(String::from("Preparing FFT tables")),
         ..View::default()
     };
+    let screen = Screen::new(cfg.debugcon);
     let mut ui = Ui {
-        screen: Screen::new(cfg.debugcon),
-        view,
+        view: View { braille: screen.graphics(), ..view },
+        screen,
         clock,
         t0: cpu::rdtsc(),
         drawn: 0,
@@ -682,6 +686,9 @@ fn test_passes(
     let moved = Moved::default();
     ui.rebase(0);
     let clock = ui.clock;
+    if row.is_none() {
+        ui.view.map = Some(MemMap::new(chunks, smp.cpus));
+    }
 
     for p in 0..passes {
         let pass = first_pass + p;
@@ -694,12 +701,19 @@ fn test_passes(
             }
             for (r, ph) in (0..rounds).flat_map(|r| (0..t.phases()).map(move |ph| (r, ph))) {
                 let pj = PhaseJob::new(t, ph, memtest::round_pass(pass, r), chunks, &moved, &sh.log, &sh.stop, isa);
+                let phase_start = moved.tested();
+                if let Some(m) = ui.view.map.as_mut().filter(|_| row.is_none()) {
+                    m.phase(t.descending(ph));
+                }
                 let mut tick = || {
                     ui.inject(chunks);
                     if !ui.due() {
                         return;
                     }
                     let d = moved.tested();
+                    if let Some(m) = ui.view.map.as_mut().filter(|_| row.is_none()) {
+                        m.swept = d - phase_start;
+                    }
                     let in_pass = (d - (p * per_pass).min(d)).min(per_pass);
                     let m = moved.traffic();
                     let now_ms = clock.ms_since(ui.t0);
@@ -737,6 +751,9 @@ fn test_passes(
                     ui.refresh(sh);
                 };
                 smp.run(&|_| pj.work(), || pj.work_one(), &mut tick);
+                if let Some(m) = ui.view.map.as_mut().filter(|_| row.is_none()) {
+                    m.swept = moved.tested() - phase_start;
+                }
                 if sh.stop.load(Ordering::Relaxed) {
                     return false;
                 }

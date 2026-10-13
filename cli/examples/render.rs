@@ -56,7 +56,7 @@ fn base(verdict: Verdict, plan: Vec<Step>, current: Current) -> View {
         errors: vec![],
         advice: String::new(),
         remote: Some(Remote { url: url.into(), status: "uploading  ·  2 s ago".into(), ok: true, qr: Some(qr(url)) }),
-        keys: vec![("Esc", "stop"), ("Q", "QR code")],
+        keys: vec![("Esc", "stop"), ("Q", "bigger QR")],
         ..View::default()
     }
 }
@@ -247,7 +247,7 @@ pub fn scenes() -> Vec<(&'static str, usize, usize, View)> {
         mem_test(TestId::MovingInvOnes, 2, 3, 6, 48),
     );
     v.qr_zoom = true;
-    v.keys = vec![("Q", "back"), ("Esc", "stop")];
+    v.keys = vec![("Q", "smaller QR"), ("Esc", "stop")];
     out.push(("7-qr-zoom", 100, 31, v));
 
     let four: Vec<Dimm> = ["A1", "A2", "B1", "B2"]

@@ -223,9 +223,12 @@ mod linux {
         CString::new(s).unwrap_or_default()
     }
 
-    /// Makes tty1 our stdin/stdout/stderr; the kernel may have given us no console at all.
+    /// Makes tty1 our stdin/stdout/stderr, in text mode; the kernel may have given us no console at all.
     fn console() {
+        /// KDSETMODE, KD_TEXT: memburn's pixel dashboard leaves the console in graphics mode if it dies.
+        const KDSETMODE: libc::Ioctl = 0x4B3A;
         if let Ok(tty) = fs::OpenOptions::new().read(true).write(true).open("/dev/tty1") {
+            unsafe { libc::ioctl(tty.as_raw_fd(), KDSETMODE, 0) };
             for fd in 0..3 {
                 unsafe { libc::dup2(tty.as_raw_fd(), fd) };
             }

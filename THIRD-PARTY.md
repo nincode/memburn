@@ -12,6 +12,7 @@ Compiled into `memburn`, `memburn.exe`, `memburn-init` and `memburn.efi`; the ta
 | Crate | Version | Licence |
 |---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
+| allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
 | anstream | 1.0.0 | MIT OR Apache-2.0 |
 | anstyle | 1.0.14 | MIT OR Apache-2.0 |
 | anstyle-parse | 1.0.0 | MIT OR Apache-2.0 |
@@ -29,6 +30,7 @@ Compiled into `memburn`, `memburn.exe`, `memburn-init` and `memburn.efi`; the ta
 | clap_lex | 1.1.1 | MIT OR Apache-2.0 |
 | colorchoice | 1.0.5 | MIT OR Apache-2.0 |
 | convert_case | 0.10.0 | MIT |
+| core_maths | 0.1.1 | MIT |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
 | crc32fast | 1.5.2 | MIT OR Apache-2.0 |
 | crossterm | 0.29.0 | MIT |
@@ -43,10 +45,14 @@ Compiled into `memburn`, `memburn.exe`, `memburn-init` and `memburn.efi`; the ta
 | document-features | 0.2.12 | MIT OR Apache-2.0 |
 | ed25519 | 2.2.3 | Apache-2.0 OR MIT |
 | ed25519-dalek | 2.2.0 | BSD-3-Clause |
+| equivalent | 1.0.2 | Apache-2.0 OR MIT |
 | errno | 0.3.14 | MIT OR Apache-2.0 |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 |
+| foldhash | 0.1.5 | Zlib |
+| fontdue | 0.9.4 | MIT OR Apache-2.0 OR Zlib |
 | generic-array | 0.14.7 | MIT |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
+| hashbrown | 0.15.5 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
 | http | 1.5.0 | MIT OR Apache-2.0 |
 | httparse | 1.10.1 | MIT OR Apache-2.0 |
@@ -93,6 +99,7 @@ Compiled into `memburn`, `memburn.exe`, `memburn-init` and `memburn.efi`; the ta
 | subtle | 2.6.1 | BSD-3-Clause |
 | syn | 2.0.119 | MIT OR Apache-2.0 |
 | syn | 3.0.8 | MIT OR Apache-2.0 |
+| ttf-parser | 0.25.1 | MIT OR Apache-2.0 |
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | ucs2 | 0.3.3 | MPL-2.0 |
 | uefi | 0.41.0 | MIT OR Apache-2.0 |
@@ -117,10 +124,17 @@ Compiled into `memburn`, `memburn.exe`, `memburn-init` and `memburn.efi`; the ta
 
 `ucs2` (UEFI build only) is MPL-2.0: its source is unmodified at https://crates.io/crates/ucs2.
 
-## Font
+## Fonts
 
 `core/src/font.rs` holds glyphs from `u_vga16.bdf` (console-setup), © 2000, 2001 Dmitry Bolkhovityanov,
 MIT licence.
+
+The pixel dashboard (`gfx/`, in the Linux and UEFI binaries) embeds, under the SIL Open Font License 1.1:
+
+| Font | Files | Copyright | Licence text |
+|---|---|---|---|
+| Inter 4.001 | Regular, SemiBold | © 2016 The Inter Project Authors | `gfx/fonts/Inter-OFL.txt` |
+| JetBrains Mono 2.211 | Regular, SemiBold | © 2020 The JetBrains Mono Project Authors | `gfx/fonts/JetBrainsMono-OFL.txt` |
 
 ## USB stick image
 
@@ -140,5 +154,7 @@ The stick image bundles these Ubuntu 26.04 binary packages, pinned in `docker/us
 named by their `Source` and `Built-Using` fields: `shim-signed` 1.59, `shim` 15.8-0ubuntu2,
 `grub2-signed` 1.215, `grub2` 2.14-2ubuntu1, `linux-signed` and `linux` 7.0.0-38.38, `busybox`
 1:1.37.0-7ubuntu1, `glibc` 2.42-2ubuntu4) from Launchpad, checks them against their `.dsc`
-checksums, and packs them as `memburn-<version>-stick-sources.tar`. Each GitHub release attaches that
-tarball; the same packages stay available at `https://launchpad.net/ubuntu/+source/<package>/<version>`.
+checksums, and packs them as `stick-sources-<hash>.tar`, where the hash is that of the pinned versions. That
+tarball is published once per set of pins as the GitHub release `stick-sources-<hash>`, and each memburn
+release's notes link to the one its stick uses; the same packages stay available at
+`https://launchpad.net/ubuntu/+source/<package>/<version>`.

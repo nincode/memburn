@@ -160,7 +160,7 @@ fn low_priority() {
 }
 
 /// A default route exists (Linux); elsewhere assumed.
-fn has_route() -> bool {
+pub fn has_route() -> bool {
     #[cfg(target_os = "linux")]
     {
         fs::read_to_string("/proc/net/route").is_ok_and(|t| t.lines().skip(1).any(default_route))

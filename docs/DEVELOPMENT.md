@@ -6,6 +6,7 @@ Every front end draws the same full-screen dashboard; networked runs upload to a
 | Crate | What |
 |---|---|
 | `core` | `no_std` tests: memory patterns, parallel phase engine, SSE2/AVX2 FFT kernels, error log, dashboard renderer, run history |
+| `gfx` | `no_std` pixel dashboard on 0x00RRGGBB canvases with Inter and JetBrains Mono (fontdue); changed spans per row |
 | `cli` | `memburn` / `memburn.exe`: terminal dashboard, plain-text mode, uploader |
 | `uefi` | `memburn.efi`: bare-metal build that uses every CPU and nearly all RAM; no network |
 | `linux-init` | PID 1 on the stick: loads drivers, starts DHCP, runs `memburn --boot` |
@@ -21,8 +22,28 @@ cargo test --workspace --exclude memburn-uefi             # core, proto, cli; fa
 scripts/run-qemu.sh                                       # bare-metal UEFI build in QEMU/OVMF
 scripts/run-qemu.sh tests/qemu-smoke.cfg                  # headless smoke run
 scripts/run-usb-qemu.sh [memburn.cfg]                     # the stick image with Secure Boot and e1000e
+scripts/stick-test.sh                                     # the stick image headless: 30 s quick check, upload, PASS
 cargo run --release -p memburn --example render -- out/   # dashboard scenes as cell dumps
+cargo run --release -p memburn --example visuals -- out/  # dashboard renders as PNG, GIF, WebP (ffmpeg)
+MEMBURN_GFX_OUT=out/ cargo test -p memburn-gfx renders    # pixel dashboard scenes as PPM at four sizes
+cargo test --release -p memburn-gfx frame_time -- --ignored --nocapture  # pixel frame times, 1080p and 4K
 ```
+
+The plan panel's free rows hold a map of the memory under test: the tested regions back to back, lit as
+the sweep passes, failing words in red, the error ranges on its title row. It draws braille where the font
+has it (terminal emulators, Windows Terminal, bare-metal UEFI on GOP) and half blocks elsewhere (Linux
+console, conhost, the UEFI text console). A fire burns under the QR code.
+
+The stick's `memburn --boot` and bare-metal UEFI on GOP draw the pixel dashboard from `gfx` instead:
+every 32-bit `/dev/fb*` (console switched to `KD_GRAPHICS`) or every GOP display of at least 640×480,
+painted once per distinct size, only changed spans copied. Without one they keep the cell dashboard; the
+Windows exe and `memburn` in a terminal always do. Snapshot hashes in `gfx/src/tests.rs` change with any
+pixel; update them after checking the renders.
+
+About one OVMF boot in 20 (Ubuntu's `OVMF_CODE_4M.fd`, KVM) stalls after console setup and before
+`BdsDxe: starting Boot0002`, so memburn never runs: 9 of 200 boots, the same with `-smp 1` and with a
+FAT image instead of `fat:rw`. `run-qemu.sh` kills a run with no output after 30 s or still running
+after 300 s and retries it once, keeping the hung attempt's OVMF log in `target/ovmf-serial-hung-<n>.log`.
 
 `memburn-uefi` builds only with `--target x86_64-unknown-uefi` (`scripts/build-efi.sh`).
 `inject=1` in a cfg (or `--inject` on the CLI) injects memory and CPU faults to check reporting.
@@ -50,7 +71,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-7-0` for 0.7.0 |
+| Volume label | `MB 0-9-0` for 0.9.0 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |
@@ -156,8 +177,9 @@ line stays under 4 KiB.
 
 ## Live view
 
-With a network the client creates a run on the server, shows its URL and QR code, and uploads a
-snapshot every 3 s. When the job ends it sends one final snapshot with the verdict and finish time
+With a network the client creates a run on the server once a default route exists (retrying after 1 s,
+doubling to 15 s), shows its URL and QR code, and uploads a snapshot every 3 s. Until then the Live view
+panel shows "waiting for network", "connecting" or the error. When the job ends it sends one final snapshot with the verdict and finish time
 (up to 4 tries) and stops; the next job from the result screen gets a new run. The page then shows
 PASS, FAIL or STOPPED and the finish time, and stops polling; a running run silent for 30 s shows
 "No updates since". Runs are kept 30 days.

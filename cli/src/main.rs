@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod fb;
 mod os;
 mod term;
 mod ui;
@@ -22,7 +24,7 @@ use memburn_core::fft::{BurnError, BurnStats, Burner, Fault, MAX_ERR, MAX_LOG2N,
 use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
 use memburn_core::smbios;
-use memburn_core::tui::{self, Current, ErrKind, ErrLine, Step, StepState, Verdict, View};
+use memburn_core::tui::{self, Current, ErrKind, ErrLine, MemMap, Step, StepState, Verdict, View};
 
 use term::Key;
 use ui::{Tone, Ui, errors_word};
@@ -316,6 +318,7 @@ fn run(args: &Args) -> Result<u8, String> {
             .chain(args.tag.iter().cloned())
             .collect(),
         dimms: smbios::dimms(&os::smbios()),
+        braille: os::braille(),
         ..View::default()
     };
     let mut out = Ui::new(full_screen, view, stop);
@@ -323,6 +326,9 @@ fn run(args: &Args) -> Result<u8, String> {
     if let Some(path) = &args.log {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
         out.log = Some(file.map_err(|e| format!("cannot open log {}: {e}", path.display()))?);
+    }
+    if args.boot && full_screen {
+        out.pixels();
     }
     out.line(&format!("memburn {}  |  {brand}  |  {threads} threads  |  {}", env!("CARGO_PKG_VERSION"), isa.name()));
     for d in &out.view.dimms.clone() {
@@ -556,6 +562,7 @@ fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, countdown: Option<u32>, las
     v.keys = keys;
     v.qr_zoom = false;
     if menu {
+        v.map = None;
         v.verdict = Verdict::Menu(countdown);
         v.job = quick.name.clone();
         v.plan = quick.plan(&c.cpus);
@@ -645,9 +652,6 @@ fn run_job(c: &mut Ctx, job: &Job) -> Result<u8, String> {
     v.current = Current::Idle;
     v.qr_zoom = false;
     v.keys = vec![("Esc", "stop")];
-    if !c.args.no_upload {
-        v.keys.push(("Q", "QR code"));
-    }
     let gib = fmt_bytes(c.test_bytes(job) as u64);
     let what = match (job.tests.is_empty(), job.burn, job.stress) {
         _ if job.cores.is_some() => {
@@ -859,6 +863,7 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
         if stress.is_some() { ((c.threads / 2).max(1), c.threads - c.threads / 2) } else { (c.threads, 0) };
     let chunks = chunk_regions(&[(region.ptr as usize, region.len)], chunk_bytes(bytes as u64, mem_threads));
     let tested: u64 = chunks.iter().map(|ch| ch.words as u64 * 8).sum();
+    c.out.view.map = Some(MemMap::new(&chunks, mem_threads));
     let per_pass: u64 = memtest::sweeps(tests) * tested;
     let pass_traffic = eta::pass_traffic(tests, tested);
     let pass_holds: u64 = tests.iter().map(|&(t, r)| eta::holds(t, r)).sum();
@@ -916,10 +921,17 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                 for (r, ph) in (0..rounds).flat_map(|r| (0..t.phases()).map(move |ph| (r, ph))) {
                     let job_ph =
                         PhaseJob::new(t, ph, memtest::round_pass(pass, r), &chunks, &moved, &c.log, c.stop, c.isa);
+                    let phase_start = moved.tested();
+                    if let Some(m) = &mut c.out.view.map {
+                        m.phase(t.descending(ph));
+                    }
                     std::thread::scope(|s| {
                         let hs: Vec<_> = (0..mem_threads).map(|_| s.spawn(|| job_ph.work())).collect();
                         while !hs.iter().all(|h| h.is_finished()) {
                             std::thread::sleep(Duration::from_millis(2));
+                            if let Some(m) = &mut c.out.view.map {
+                                m.swept = moved.tested() - phase_start;
+                            }
                             if c.out.tick().is_some() || shown.elapsed() < Duration::from_millis(250) {
                                 continue;
                             }
@@ -986,6 +998,9 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                             );
                         }
                     });
+                    if let Some(m) = &mut c.out.view.map {
+                        m.swept = moved.tested() - phase_start;
+                    }
                     if over(c.stop) {
                         break;
                     }

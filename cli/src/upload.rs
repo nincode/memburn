@@ -6,13 +6,27 @@ use std::time::{Duration, Instant};
 use memburn_proto::{Created, Snapshot};
 
 const EVERY: Duration = Duration::from_secs(3);
-const RETRY: Duration = Duration::from_secs(15);
+/// Delay after a failed run creation: the first, doubling up to the second.
+const RETRY: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(15));
+const ROUTE_POLL: Duration = Duration::from_millis(250);
 /// Attempts at the final snapshot, this far apart.
 const FINAL_TRIES: u32 = 4;
 const FINAL_GAP: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Phase {
+    #[default]
+    Waiting,
+    Connecting,
+    Up,
+}
+
 #[derive(Clone, Default)]
 pub struct State {
+    pub phase: Phase,
+    /// When a default route appeared, and how long creating the run took after it.
+    pub route_at: Option<Instant>,
+    pub created_after: Option<Duration>,
     pub url: Option<String>,
     pub ok: bool,
     pub last_ok: Option<Instant>,
@@ -73,7 +87,19 @@ impl Uploader {
 
 fn run(server: &str, shared: &Mutex<Shared>) {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().into();
+    let mut delay = RETRY.0;
     let created = loop {
+        while !crate::update::has_route() {
+            if pause(shared, ROUTE_POLL) {
+                shared.lock().unwrap().state.done = Some(false);
+                return;
+            }
+        }
+        {
+            let mut s = shared.lock().unwrap();
+            s.state.phase = Phase::Connecting;
+            s.state.route_at.get_or_insert_with(Instant::now);
+        }
         match agent
             .post(format!("{server}/memburn/api/runs"))
             .send_empty()
@@ -89,13 +115,16 @@ fn run(server: &str, shared: &Mutex<Shared>) {
                 }
             }
         }
-        let t0 = Instant::now();
-        while t0.elapsed() < RETRY && !shared.lock().unwrap().last {
-            std::thread::sleep(Duration::from_millis(100));
+        if pause(shared, delay) {
+            shared.lock().unwrap().state.done = Some(false);
+            return;
         }
+        delay = (delay * 2).min(RETRY.1);
     };
     {
         let mut s = shared.lock().unwrap();
+        s.state.phase = Phase::Up;
+        s.state.created_after = s.state.route_at.map(|t| t.elapsed());
         s.state.url = Some(created.url.clone());
         s.state.error = None;
     }
@@ -139,6 +168,18 @@ fn run(server: &str, shared: &Mutex<Shared>) {
             }
         }
     }
+}
+
+/// Sleeps `d` in short steps; true when the final snapshot was queued meanwhile.
+fn pause(shared: &Mutex<Shared>, d: Duration) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < d {
+        if shared.lock().unwrap().last {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    shared.lock().unwrap().last
 }
 
 fn short(e: &ureq::Error) -> String {

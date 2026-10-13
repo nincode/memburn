@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use memburn_core::font;
 use memburn_core::tui::Cell;
+use memburn_gfx::{Canvas, Span, rects};
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol, SearchType};
 use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput, PixelFormat};
 use uefi::proto::device_path::DevicePath;
@@ -174,6 +175,29 @@ impl Display {
             }
         }
         self.blit(self.origin.0 + x * cw, self.origin.1 + y * ch, w, ch);
+    }
+
+    /// Copies the `spans` of `c`, which is this display's size, to the screen.
+    pub fn show(&mut self, c: &Canvas, spans: &[Span]) {
+        if self.fb.is_null() {
+            let px = unsafe { core::slice::from_raw_parts(c.px.as_ptr() as *const BltPixel, c.px.len()) };
+            for (x, y, w, h) in rects(spans) {
+                let src = BltRegion::SubRectangle { coords: (x, y), px_stride: c.w };
+                let _ = self.gop.blt(BltOp::BufferToVideo { buffer: px, src, dest: (x, y), dims: (w, h) });
+            }
+            return;
+        }
+        for sp in spans.iter().filter(|sp| sp.y < self.height && sp.x1 <= self.width) {
+            let src = &c.row(sp.y)[sp.x0..sp.x1];
+            let dst = unsafe { core::slice::from_raw_parts_mut(self.fb.add(sp.y * self.stride + sp.x0), src.len()) };
+            if self.rgb {
+                for (d, &p) in dst.iter_mut().zip(src) {
+                    *d = (p & 0xff00) | (p >> 16 & 0xff) | (p & 0xff) << 16;
+                }
+            } else {
+                dst.copy_from_slice(src);
+            }
+        }
     }
 
     /// Copies `buf`, `w` × `h` pixels, to (`x`, `y`) on screen.

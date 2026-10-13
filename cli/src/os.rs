@@ -349,6 +349,15 @@ pub fn term_width() -> usize {
     0
 }
 
+/// The terminal's font has braille patterns: Windows Terminal on Windows, a terminal emulator on Linux (not the console).
+pub fn braille() -> bool {
+    braille_for(cfg!(windows), std::env::var_os("WT_SESSION").is_some(), std::env::var("TERM").ok().as_deref())
+}
+
+fn braille_for(windows: bool, wt_session: bool, term: Option<&str>) -> bool {
+    if windows { wt_session } else { !matches!(term, None | Some("" | "linux" | "dumb" | "vt100" | "vt220")) }
+}
+
 /// Turns on ANSI escape handling where the console needs it; false when stdout is not a terminal.
 pub fn enable_ansi() -> bool {
     use std::io::IsTerminal;
@@ -413,6 +422,15 @@ fn hwmon_max(names: &[&str]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn braille_only_where_the_font_has_it() {
+        assert!(braille_for(true, true, None));
+        assert!(!braille_for(true, false, Some("xterm-256color")));
+        assert!(braille_for(false, false, Some("xterm-256color")));
+        assert!(!braille_for(false, false, Some("linux")));
+        assert!(!braille_for(false, false, None));
+    }
 
     #[test]
     fn decodes_pagemap_entries() {

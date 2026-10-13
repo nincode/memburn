@@ -1,6 +1,6 @@
 //! 8x16 bitmap font for the framebuffer console: printable ASCII plus the symbols `tui::render` draws.
 
-// Glyphs from u_vga16.bdf (console-setup), © 2000, 2001 Dmitry Bolkhovityanov, MIT license; ▀▄► drawn here.
+// Glyphs from u_vga16.bdf (console-setup), © 2000, 2001 Dmitry Bolkhovityanov, MIT license; ▀▄►■ and braille drawn here.
 
 pub const WIDTH: usize = 8;
 pub const HEIGHT: usize = 16;
@@ -109,7 +109,7 @@ static ASCII: [Glyph; 95] = [
 
 /// Sorted by char.
 #[rustfmt::skip]
-static EXTRA: [(char, Glyph); 14] = [
+static EXTRA: [(char, Glyph); 15] = [
     ('\u{00b0}', [0x00, 0x38, 0x6c, 0x6c, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     ('\u{00b7}', [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     ('\u{00d7}', [0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x3c, 0x18, 0x3c, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
@@ -123,12 +123,38 @@ static EXTRA: [(char, Glyph); 14] = [
     ('\u{2584}', [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
     ('\u{2588}', [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
     ('\u{2591}', [0x11, 0x44, 0x11, 0x44, 0x11, 0x44, 0x11, 0x44, 0x11, 0x44, 0x11, 0x44, 0x11, 0x44, 0x11, 0x44]),
+    ('\u{25a0}', [0x00, 0x00, 0x00, 0x00, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00]),
     ('\u{25ba}', [0x00, 0x00, 0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80, 0x00, 0x00]),
 ];
+
+/// Braille patterns U+2800..U+28FF: 2×4 dots of 2×2 pixels.
+static BRAILLE: [Glyph; 256] = braille();
+
+const fn braille() -> [Glyph; 256] {
+    let mut out = [[0u8; HEIGHT]; 256];
+    // (column, row) of dots 1..8, Unicode bit order.
+    let dots = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
+    let mut p = 0;
+    while p < 256 {
+        let mut d = 0;
+        while d < 8 {
+            if p >> d & 1 == 1 {
+                let (col, row) = dots[d];
+                let bits: u8 = if col == 0 { 0x60 } else { 0x06 };
+                out[p][row * 4 + 1] |= bits;
+                out[p][row * 4 + 2] |= bits;
+            }
+            d += 1;
+        }
+        p += 1;
+    }
+    out
+}
 
 pub fn glyph(c: char) -> Option<&'static Glyph> {
     match c {
         ' '..='~' => Some(&ASCII[c as usize - 32]),
+        '\u{2800}'..='\u{28ff}' => Some(&BRAILLE[c as usize - 0x2800]),
         _ => EXTRA.binary_search_by_key(&c, |e| e.0).ok().map(|i| &EXTRA[i].1),
     }
 }
@@ -148,6 +174,9 @@ mod tests {
         assert_eq!(glyph('▀').map(|g| g[0]), Some(0xff));
         assert!(EXTRA.windows(2).all(|w| w[0].0 < w[1].0));
         assert_eq!(glyph('\u{2603}'), None);
+        assert_eq!(glyph('\u{2800}'), Some(&[0; HEIGHT]));
+        assert_eq!(glyph('\u{2801}').map(|g| (g[1], g[2], g[3])), Some((0x60, 0x60, 0)));
+        assert_eq!(glyph('\u{2880}').map(|g| (g[13], g[14])), Some((0x06, 0x06)));
         assert_eq!(glyph_or_mark('\u{2603}'), glyph_or_mark('?'));
     }
 }

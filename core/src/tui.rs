@@ -13,6 +13,12 @@ use crate::history::History;
 use crate::memtest::TestId;
 use crate::smbios::Dimm;
 
+mod fire;
+mod map;
+
+pub use fire::Fire;
+pub use map::{ErrRange, MemMap, RANGE_BYTES, Sample, range_label};
+
 /// The 16 text-mode colors in VGA/UEFI order; backgrounds use only the first 8.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -395,6 +401,12 @@ pub struct View {
     pub qr_zoom: bool,
     /// Shown in the band until the next run starts, e.g. that the previous run did not finish.
     pub notice: String,
+    /// Memory map of the running or last memory test.
+    pub map: Option<MemMap>,
+    /// The display draws braille patterns; else the map uses half blocks.
+    pub braille: bool,
+    /// Drawn under the QR code.
+    pub fire: Fire,
 }
 
 impl Default for View {
@@ -420,6 +432,9 @@ impl Default for View {
             keys: Vec::new(),
             qr_zoom: false,
             notice: String::new(),
+            map: None,
+            braille: false,
+            fire: Fire::default(),
         }
     }
 }
@@ -461,12 +476,14 @@ impl View {
     }
 }
 
+/// Modules of a live-view URL's QR code, for sizing the column before the code exists.
+const QR_SIZE: usize = 29;
+
 /// Width of the QR column, or 0 when the screen has no room for it.
 fn qr_column(v: &View, w: usize, h: usize) -> usize {
-    match &v.remote {
-        Some(Remote { qr: Some(q), .. }) if w >= 120 && h >= q.size / 2 + 12 => q.size + 8,
-        _ => 0,
-    }
+    let Some(r) = &v.remote else { return 0 };
+    let size = r.qr.as_ref().map_or(QR_SIZE, |q| q.size);
+    if w >= 120 && h >= size / 2 + 12 { size + 8 } else { 0 }
 }
 
 pub fn render(v: &View, f: &mut Frame) {
@@ -554,7 +571,7 @@ fn band(v: &View, f: &mut Frame) {
     f.text(2, 2, &sub, w - 4, fg, bg);
 }
 
-fn error_summary(v: &View) -> String {
+pub fn error_summary(v: &View) -> String {
     match (v.mem_errors, v.cpu_errors) {
         (0, 0) => String::from("no errors"),
         (m, 0) => format!("{} MEMORY ERROR{}", group(m), plural_s(m)),
@@ -585,7 +602,7 @@ fn footer(v: &View, f: &mut Frame) {
     if let Some(r) = &v.remote
         && qr_column(v, f.w, f.h) == 0
     {
-        let s = format!("Live: {}", r.url);
+        let s = format!("Live: {}", if r.url.is_empty() { &r.status } else { &r.url });
         if x + s.chars().count() < f.w {
             f.text_right(f.w - 1, y, &s, if r.ok { LightCyan } else { DarkGray }, Black);
         }
@@ -711,8 +728,31 @@ fn bar(f: &mut Frame, x: usize, y: usize, w: usize, pct: usize, color: Color) {
     f.text_right(x + w, y, &format!("{pct}%"), White, Black);
 }
 
+/// Rows the memory map needs below the plan: a title row and two map rows.
+const MAP_MIN_H: usize = 3;
+const MAP_MIN_W: usize = 24;
+
 fn plan(v: &View, f: &mut Frame, r: Rect) {
     let i = f.panel(r, &v.job, None);
+    if let Some(m) = &v.map
+        && m.total > 0
+        && i.w >= MAP_MIN_W
+        && i.h >= v.plan.len() + MAP_MIN_H
+    {
+        let y = i.y + v.plan.len();
+        for x in i.x - 1..i.x + 1 {
+            f.set(x, y, '─', DarkGray, Black);
+        }
+        let title = " Memory map ";
+        let x = if title.len() + map::legend_width(m) <= i.w {
+            f.text(i.x + 1, y, title, i.w, LightGray, Black) + 1
+        } else {
+            i.x + 2
+        };
+        map::legend(f, m, x, i.x + i.w, y);
+        let area = Rect { x: i.x, y: y + 1, w: i.w, h: i.y + i.h - y - 1 };
+        map::draw(f, m, area, v.braille, v.elapsed_ms);
+    }
     let running = v.plan.iter().position(|s| s.state == StepState::Running).unwrap_or(0);
     let skip = (running + 1).saturating_sub(i.h);
     for (n, s) in v.plan.iter().skip(skip).take(i.h).enumerate() {
@@ -864,7 +904,7 @@ fn modules_height(n: usize, h: usize) -> usize {
 }
 
 /// Short slot name: the locator when it tells the modules apart, else the bank, else both.
-fn slot(d: &Dimm, all: &[Dimm]) -> String {
+pub fn slot(d: &Dimm, all: &[Dimm]) -> String {
     let unique = |f: fn(&Dimm) -> &str| !f(d).is_empty() && all.iter().filter(|o| f(o) == f(d)).count() == 1;
     if unique(|d| &d.locator) {
         d.locator.clone()
@@ -913,7 +953,7 @@ fn modules(v: &View, f: &mut Frame, r: Rect) {
 }
 
 /// Bits that flipped at least 3 times, always in the same direction: "stuck at 1: bit 17".
-fn stuck_bits(bits: &[BitStat]) -> Option<String> {
+pub fn stuck_bits(bits: &[BitStat]) -> Option<String> {
     let at = |one: bool| -> Vec<String> {
         bits.iter()
             .filter(|s| if one { s.up >= 3 && s.down == 0 } else { s.down >= 3 && s.up == 0 })
@@ -934,11 +974,16 @@ fn stuck_bits(bits: &[BitStat]) -> Option<String> {
 fn remote(v: &View, f: &mut Frame, r: Rect) {
     let Some(rem) = &v.remote else { return };
     let i = f.panel(r, "Live view", None);
-    let Some(q) = &rem.qr else { return };
+    let Some(q) = &rem.qr else {
+        f.text(i.x, i.y, &rem.status, i.w, if rem.ok { LightGreen } else { LightGray }, Black);
+        return;
+    };
     draw_qr(f, q, i.x + i.w.saturating_sub(q.size + 4) / 2, i.y);
     let y = i.y + q.size.div_ceil(2) + 3;
     f.text(i.x, y, &rem.url, i.w, LightCyan, Black);
     f.text(i.x, y + 1, &rem.status, i.w, if rem.ok { LightGreen } else { DarkGray }, Black);
+    let top = y + 3;
+    v.fire.draw(f, Rect { x: i.x - 1, y: top, w: i.w + 2, h: (i.y + i.h).saturating_sub(top) });
 }
 
 /// Two modules per cell, dark on light, with a 2-module quiet zone.
@@ -1041,11 +1086,11 @@ pub fn clock(ms: u64) -> String {
 }
 
 /// One decimal from an integer count of tenths.
-fn tenths(t: u64) -> String {
+pub fn tenths(t: u64) -> String {
     format!("{}.{}", t / 10, t % 10)
 }
 
-fn gib(bytes: u64) -> String {
+pub fn gib(bytes: u64) -> String {
     format!("{} GiB", tenths(bytes * 10 / (1 << 30)))
 }
 
@@ -1121,7 +1166,27 @@ mod tests {
             keys: vec![("Esc", "stop")],
             qr_zoom: false,
             notice: String::new(),
+            ..View::default()
         }
+    }
+
+    #[test]
+    fn live_view_shows_its_state_before_the_qr_code() {
+        let mut v = sample();
+        v.remote =
+            Some(Remote { url: String::new(), status: String::from("waiting for network"), ok: false, qr: None });
+        let mut f = Frame::new(160, 50);
+        render(&v, &mut f);
+        let row = |y: usize| (0..f.w).map(|x| f.get(x, y).ch).collect::<String>();
+        assert!(row(3).contains("Live view"));
+        assert!(row(4).contains("waiting for network"));
+        let mut f = Frame::new(100, 31);
+        render(&v, &mut f);
+        assert!(row_of(&f, 30).ends_with("Live: waiting for network "));
+    }
+
+    fn row_of(f: &Frame, y: usize) -> String {
+        (0..f.w).map(|x| f.get(x, y).ch).collect()
     }
 
     #[test]

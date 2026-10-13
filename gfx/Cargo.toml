@@ -1,0 +1,13 @@
+[package]
+name = "memburn-gfx"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+[dependencies]
+memburn-core = { path = "../core" }
+fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+libm = "0.2.16"
+
+[dev-dependencies]
+qrcodegen = "1.8"

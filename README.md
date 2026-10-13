@@ -10,7 +10,7 @@ Memory test and CPU burn-in on a bootable USB stick.
 
 Download the stick image from [Releases](https://github.com/nincode/memburn/releases/latest) or https://reljam.com/memburn/.
 
-![Quick check running on the stick](docs/img/quick-check.png)
+![The dashboard during a failing full memory test: 39 flipped bits in two places, red on the memory map](docs/img/dashboard-fail.webp)
 
 <p>
 <img src="docs/img/bg-failing-run.webp" alt="Photo of a failing run on a Ryzen 9 5950X with four DDR4 modules: 39 flipped bits in two places" width="70%">
@@ -74,7 +74,7 @@ A wrong disk name erases that disk. Check the size in `lsblk` or `diskutil list`
 | Key | |
 |---|---|
 | Esc | stop the run after the current step |
-| Q | larger QR code |
+| Q | bigger or smaller QR code, once the Live view is up |
 | R / P | restart / power off, from the menu or result screen |
 | U | update now, shown while a newer release downloads or waits |
 
@@ -154,4 +154,4 @@ sudo ./memburn-<version>-linux-x86_64 -m quick --plain  # one quick check, plain
 ## More
 
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): build, tests, QEMU, internals, all CLI options.
-- MIT licence, see [LICENSE](LICENSE). [THIRD-PARTY.md](THIRD-PARTY.md) lists the crates and the stick's Ubuntu parts (shim, GRUB, Linux, BusyBox) with their licences. Each release attaches their sources.
+- MIT licence, see [LICENSE](LICENSE). [THIRD-PARTY.md](THIRD-PARTY.md) lists the crates and the stick's Ubuntu parts (shim, GRUB, Linux, BusyBox) with their licences. Each release's notes link to their sources.

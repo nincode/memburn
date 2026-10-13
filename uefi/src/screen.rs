@@ -6,6 +6,7 @@ use core::arch::asm;
 use core::fmt::Write;
 
 use memburn_core::tui::{self, Frame, View};
+use memburn_gfx::{Canvas, MIN_SIZE, Painter, damage};
 use uefi::CStr16;
 use uefi::proto::console::text::{Color, Key, ScanCode};
 use uefi::system;
@@ -33,7 +34,7 @@ const COLORS: [Color; 16] = [
 ];
 
 /// ASCII stand-ins for dashboard glyphs the console font may lack.
-const FALLBACK: [(char, char); 14] = [
+const FALLBACK: [(char, char); 15] = [
     ('─', '-'),
     ('│', '|'),
     ('┌', '+'),
@@ -48,6 +49,7 @@ const FALLBACK: [(char, char); 14] = [
     ('·', '.'),
     ('°', ' '),
     ('×', 'x'),
+    ('■', '#'),
 ];
 
 /// Log lines kept from the start of the session and from its end.
@@ -69,6 +71,10 @@ pub struct Screen {
     debugcon: bool,
     /// Empty: the text console draws.
     displays: Vec<Display>,
+    /// The pixel dashboard, when every display is at least [`MIN_SIZE`]; else the displays show the text grid.
+    painter: Option<Painter>,
+    /// Per distinct display size: the frame being painted and the one on screen.
+    canvases: Vec<(Canvas, Option<Canvas>)>,
 }
 
 impl Screen {
@@ -85,6 +91,9 @@ impl Screen {
                 })
                 .collect();
             let mut s = Screen::with(cols, rows, Vec::new(), debugcon, displays);
+            if s.displays.iter().all(|d| d.width >= MIN_SIZE.0 && d.height >= MIN_SIZE.1) {
+                s.painter = Some(Painter::new());
+            }
             for l in lines {
                 s.log(l);
             }
@@ -126,6 +135,8 @@ impl Screen {
             dropped: 0,
             debugcon,
             displays,
+            painter: None,
+            canvases: Vec::new(),
         }
     }
 
@@ -158,7 +169,15 @@ impl Screen {
         text
     }
 
+    /// Draws on GOP displays with the built-in font, braille included.
+    pub fn graphics(&self) -> bool {
+        !self.displays.is_empty()
+    }
+
     pub fn draw(&mut self, v: &View) {
+        if self.painter.is_some() {
+            return self.draw_pixels(v);
+        }
         if !self.displays.is_empty() {
             return self.draw_gop(v);
         }
@@ -191,6 +210,33 @@ impl Screen {
             }
         });
         self.shown = Some(f);
+    }
+
+    /// Paints `v` once per display size and copies the changed spans to each display of that size.
+    fn draw_pixels(&mut self, v: &View) {
+        let Some(painter) = self.painter.as_mut() else { return };
+        let mut sizes: Vec<(usize, usize)> = self.displays.iter().map(|d| (d.width, d.height)).collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        for &(w, h) in &sizes {
+            let i = match self.canvases.iter().position(|(c, _)| (c.w, c.h) == (w, h)) {
+                Some(i) => i,
+                None => {
+                    self.canvases.push((Canvas::new(w, h), None));
+                    self.canvases.len() - 1
+                }
+            };
+            let (cur, shown) = &mut self.canvases[i];
+            painter.paint(v, cur);
+            let spans = damage(shown.as_ref(), cur);
+            for d in self.displays.iter_mut().filter(|d| (d.width, d.height) == (w, h)) {
+                d.show(cur, &spans);
+            }
+            match shown {
+                Some(s) => core::mem::swap(s, cur),
+                None => *shown = Some(core::mem::replace(cur, Canvas::new(w, h))),
+            }
+        }
     }
 
     fn draw_gop(&mut self, v: &View) {
