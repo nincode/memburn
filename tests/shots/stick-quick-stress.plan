@@ -1,0 +1,18 @@
+# The stick: quick check, its result, then S starts stress from the result screen.
+target stick
+size 1280x800
+cfg mode=quick
+cfg seconds=10
+cfg mem_mib=512
+cfg upload=0
+cfg update=off
+wait log ^Quick check: 120
+sleep 3
+shot quick
+wait log ^Result: 120
+sleep 1
+shot result
+key s
+wait log ^Stress: 30
+sleep 4
+shot stress

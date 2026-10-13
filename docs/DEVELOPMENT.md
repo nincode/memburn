@@ -25,8 +25,12 @@ scripts/run-usb-qemu.sh [memburn.cfg]                     # the stick image with
 scripts/stick-test.sh                                     # the stick image headless: 30 s quick check, upload, PASS
 cargo run --release -p memburn --example render -- out/   # dashboard scenes as cell dumps
 cargo run --release -p memburn --example visuals -- out/  # dashboard renders as PNG, GIF, WebP (ffmpeg)
+cargo run --release -p memburn --example visuals -- out/ states  # every fixture state as PNG, text and pixel
+cargo run --release -p memburn --example visuals -- out/ anim    # animated pixel dashboard WebPs for the README and web page
+scripts/shots.sh tests/shots/*.plan                       # QEMU screenshots of the stick and UEFI, in parallel
 MEMBURN_GFX_OUT=out/ cargo test -p memburn-gfx renders    # pixel dashboard scenes as PPM at four sizes
 cargo test --release -p memburn-gfx frame_time -- --ignored --nocapture  # pixel frame times, 1080p and 4K
+cargo run --release -p memburn --example burnbench -- [rounds] [secs]  # what the FFT lanes cost the burn-in
 ```
 
 The plan panel's free rows hold a map of the memory under test: the tested regions back to back, lit as
@@ -51,6 +55,22 @@ after 300 s and retries it once, keeping the hung attempt's OVMF log in `target/
 `scripts/mkusb.sh --build-arg MEMBURN_RELEASE_KEY=<hex>` builds a stick that trusts another release
 key (`scripts/release-key.sh KEY` prints it); `scripts/sign-manifest.sh` signs a manifest for it, and a
 server built with the same `MEMBURN_RELEASE_KEY` serves it.
+`mkusb.sh` runs in two trees share one cargo cache: build them one after another, and force a rebuild
+with `--no-cache-filter build,stick`.
+
+## Screenshots
+
+| | |
+|---|---|
+| Headless | `cargo run --release -p memburn --example visuals -- <dir> states [filter]` writes `<state>-text160x50.png`, `-text80x25.png` (the stick's 8×16 font), `-1280x800.png` and `-1920x1080.png` for every state in `gfx/src/fixtures.rs` in under a second, and checks the snapshot states against their hashes. A new dashboard state gets a fixture there first |
+| Animated | `cargo run --release -p memburn --example visuals -- <dir> anim [filter]` writes `anim-memtest-fail.webp` (a failing Modulo 20 test, the sweep finding both error ranges each pass) and `anim-burn-in-fail.webp` (FFT burn-in, CPU 6 returning a wrong result) from the gfx fixtures: lossless animated WebP, 1280×800, one frame per 250 ms like the dashboard's redraw, under 400 KB each. Copied to `docs/img/pixel-*.webp` and the web page's images |
+| QEMU | `scripts/shots.sh [-j N] [-o DIR] PLAN...` boots each plan's stick image or UEFI build, follows its steps and writes `DIR/<plan>-<shot>.png` (default `target/shots`), N plans at once (default 4), each with its own image copy, OVMF vars and monitor socket; it kills its QEMUs on exit and stops a plan at the first step that times out, with the log's last lines |
+| Plans | `tests/shots/*.plan`, one step per line: `target stick\|uefi`, `size WxH` (OVMF PlatformConfig; bare-metal UEFI picks its own mode), `cfg LINE`, `smp`, `mem`, `net 0\|1`, `secure-boot 0\|1`, `qemu ARGS`, then `wait log\|serial REGEX [S]`, `sleep S`, `key KEY...` (QEMU sendkey names), `shot NAME`, `exit [S]`. `log` is the stick's `memburn.log` or UEFI's debugcon |
+| Needs | `target/usb/memburn-<version>-usb.img` for stick plans (`scripts/mkusb.sh`); `virt-fw-vars` on the PATH or `uv` |
+
+Review shots come from the headless renders; QEMU proves one real boot per target. The two shipped plans
+(stick quick check → S → stress, UEFI smoke run) take about 45 s together.
+
 
 ## Modes
 
@@ -71,7 +91,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-9-0` for 0.9.0 |
+| Volume label | `MB 0-9-3` for 0.9.3 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |
@@ -83,14 +103,18 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 The stick's Linux entry asks the live-view server for the latest release from a background thread
 (nice 19, idle I/O) once a default route exists, retrying every 2 s doubling to 60 s for as long as memburn
 runs. A newer release whose manifest carries a valid signature of the release key is downloaded and staged
-right away; U on the menu, the run or the result screen (or `update=auto`) opts in. `update=off` sends no check.
+right away; U on the menu, the run or the result screen (or `update=auto`) opts in. `update=off` sends no check
+until U: then memburn checks, downloads, installs and starts a newer release as an opt-in does, or shows "up to
+date". While no check runs and nothing is on offer (`update=off`, up to date, failed), the menu and result screens
+list U, which checks again.
 
 | | |
 |---|---|
 | Manifest | version, the stick's files as one tar (URL, size, SHA-256), and each file's path, size and SHA-256; signed with Ed25519, public key in `proto/src/release.rs` |
-| Stage | streams the tar, writes each changed file as `<file>.new` beside the old one with fsync, and checks every file's hash and the tar's; any error removes the `.new` files |
-| Install | renames the `.new` files into place with `grub.cfg` last and syncs: without opt-in when the run ends (used at the next boot), with opt-in at once, stopping a run |
-| Start | with opt-in: when the release's `vmlinuz` and `memburn-init` hash the same as the booted kernel and `/init`, memburn copies the new `memburn` to `/memburn-next` and exits 12, and init runs it with the same arguments plus `--updated-from` and `--job`; otherwise exit 10 reboots |
+| Stage | streams the tar, writes each changed file as `<file>.new` beside the old one with fsync, and checks every file's hash and the tar's, then reads the written files back from the stick past the page cache and checks them again; any error removes the `.new` files |
+| Install | renames the `.new` files into place with `grub.cfg` last and syncs: without opt-in when the run ends (R starts it), with opt-in at once, stopping a run |
+| Start | memburn copies the new `memburn` to `/memburn-next`, checks its hash and execs it in its own process with this run's arguments plus `--updated-from` and `--job` (or `--menu`), so init sees no exit; a new kernel and `memburn-init` start at the next boot. Only when the exec fails does memburn exit 12, and init (every version since 0.6) runs `/memburn-next` with the arguments in `/memburn-next.args` |
+| Keys | R execs memburn again at the menu (the installed update's binary, if any); O exits 10 and init reboots; P exits 11 and init powers off |
 | Layout | `EFI/memburn/<version>/` holds each version's `vmlinuz`, `initrd.img`, `memburn`, `memburn-init` and `memburn.efi`; GRUB boots the new version by default and keeps `memburn <old> (previous)` entries; older versions are deleted |
 | Never written | `memburn.cfg`, `memburn.log`, `memburn-history.txt`, `memburn-crash-*.txt` |
 | Refused | a bad signature, a version not newer than the running one and the stick's, a hash mismatch, a short download; the stick stays unchanged |

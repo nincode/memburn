@@ -13,9 +13,11 @@ use crate::history::History;
 use crate::memtest::TestId;
 use crate::smbios::Dimm;
 
+mod fft;
 mod fire;
 mod map;
 
+pub use fft::{ErrRow, FftView, LaneView, Tick, fault_text, margin, sci};
 pub use fire::Fire;
 pub use map::{ErrRange, MemMap, RANGE_BYTES, Sample, range_label};
 
@@ -175,6 +177,7 @@ pub enum Current {
         count: u32,
         step: u32,
         steps: u32,
+        /// Bytes this step has swept, set with [`View::swept`] together with the map's.
         done: u64,
         total: u64,
         /// This test's time left; None while estimating.
@@ -371,6 +374,32 @@ pub struct Remote {
     pub qr: Option<Qr>,
 }
 
+/// The stick update's state, shown in the Live view panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateLine {
+    pub text: String,
+    /// Amount, file count, the key that acts on it, or the error.
+    pub detail: String,
+    /// (done, total) for a progress bar.
+    pub bar: Option<(u64, u64)>,
+    pub tone: UpdateTone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateTone {
+    Busy,
+    Ready,
+    Quiet,
+    Error,
+}
+
+impl UpdateLine {
+    /// Percent of the bar, when there is one.
+    pub fn percent(&self) -> Option<u64> {
+        self.bar.map(|(done, total)| (done * 100).checked_div(total).unwrap_or(0).min(100))
+    }
+}
+
 pub struct View {
     pub version: &'static str,
     /// CPU, threads, ISA, RAM; trailing parts are dropped when the header is too narrow.
@@ -407,6 +436,10 @@ pub struct View {
     pub braille: bool,
     /// Drawn under the QR code.
     pub fire: Fire,
+    /// The stick update, under the QR code or in the panel on its own.
+    pub update: Option<UpdateLine>,
+    /// FFT lanes and errors while burners run: burn-in or the FFT half of stress.
+    pub fft: Option<FftView>,
 }
 
 impl Default for View {
@@ -435,6 +468,8 @@ impl Default for View {
             map: None,
             braille: false,
             fire: Fire::default(),
+            update: None,
+            fft: None,
         }
     }
 }
@@ -469,6 +504,16 @@ impl View {
         }
     }
 
+    /// Bytes the current memory-test step has swept: the map's sweep and the progress figure.
+    pub fn swept(&mut self, bytes: u64) {
+        if let Some(m) = &mut self.map {
+            m.swept = bytes;
+        }
+        if let Current::Mem { done, total, .. } = &mut self.current {
+            *done = bytes.min(*total);
+        }
+    }
+
     /// Clears the errors of the previous run.
     pub fn clear_errors(&mut self) {
         self.errors.clear();
@@ -481,8 +526,11 @@ const QR_SIZE: usize = 29;
 
 /// Width of the QR column, or 0 when the screen has no room for it.
 fn qr_column(v: &View, w: usize, h: usize) -> usize {
-    let Some(r) = &v.remote else { return 0 };
-    let size = r.qr.as_ref().map_or(QR_SIZE, |q| q.size);
+    let size = match &v.remote {
+        Some(r) => r.qr.as_ref().map_or(QR_SIZE, |q| q.size),
+        None if v.update.is_some() => QR_SIZE,
+        None => return 0,
+    };
     if w >= 120 && h >= size / 2 + 12 { size + 8 } else { 0 }
 }
 
@@ -599,14 +647,48 @@ fn footer(v: &View, f: &mut Frame) {
         x = f.text(x, y, &format!(" {key} "), f.w.saturating_sub(x), Black, LightGray);
         x = f.text(x + 1, y, action, f.w.saturating_sub(x + 1), LightGray, Black) + 3;
     }
-    if let Some(r) = &v.remote
-        && qr_column(v, f.w, f.h) == 0
-    {
-        let s = format!("Live: {}", if r.url.is_empty() { &r.status } else { &r.url });
-        if x + s.chars().count() < f.w {
-            f.text_right(f.w - 1, y, &s, if r.ok { LightCyan } else { DarkGray }, Black);
+    if qr_column(v, f.w, f.h) > 0 {
+        return;
+    }
+    let mut end = f.w - 1;
+    if let Some(u) = &v.update {
+        let s = if u.detail.is_empty() { u.text.clone() } else { format!("{}  ·  {}", u.text, u.detail) };
+        let n = s.chars().count();
+        if x + n < end {
+            f.text_right(end, y, &s, update_color(u.tone), Black);
+            end = end.saturating_sub(n + 3);
         }
     }
+    if let Some(r) = &v.remote {
+        let s = format!("Live: {}", if r.url.is_empty() { &r.status } else { &r.url });
+        if x + s.chars().count() < end {
+            f.text_right(end, y, &s, if r.ok { LightCyan } else { DarkGray }, Black);
+        }
+    }
+}
+
+fn update_color(t: UpdateTone) -> Color {
+    match t {
+        UpdateTone::Busy => LightGray,
+        UpdateTone::Ready => LightGreen,
+        UpdateTone::Quiet => DarkGray,
+        UpdateTone::Error => LightRed,
+    }
+}
+
+/// The update's lines from `y`: text, detail, bar; returns the row after them.
+fn update_lines(f: &mut Frame, u: &UpdateLine, x: usize, y: usize, w: usize) -> usize {
+    f.text(x, y, &u.text, w, update_color(u.tone), Black);
+    let mut y = y + 1;
+    if !u.detail.is_empty() {
+        f.text(x, y, &u.detail, w, LightGray, Black);
+        y += 1;
+    }
+    if let Some(pct) = u.percent() {
+        bar(f, x, y, w, pct as usize, LightCyan);
+        y += 1;
+    }
+    y
 }
 
 fn current(v: &View, f: &mut Frame, r: Rect) {
@@ -731,15 +813,34 @@ fn bar(f: &mut Frame, x: usize, y: usize, w: usize, pct: usize, color: Color) {
 /// Rows the memory map needs below the plan: a title row and two map rows.
 const MAP_MIN_H: usize = 3;
 const MAP_MIN_W: usize = 24;
+/// Plan steps left in view when the thread lanes need the panel.
+const STEPS_KEPT: usize = 2;
 
 fn plan(v: &View, f: &mut Frame, r: Rect) {
     let i = f.panel(r, &v.job, None);
+    let (mut steps_h, mut lanes_h) = (v.plan.len().min(i.h), 0);
+    if let Some(fv) = &v.fft {
+        let n = fv.lanes.len();
+        let (fit, full) = (fft::lanes_rows(n, i.w), 1 + n);
+        let free = i.h - steps_h;
+        let squeezed = free.max(fit.min(i.h - v.plan.len().min(STEPS_KEPT)));
+        lanes_h = if matches!(v.current, Current::Burn { .. }) {
+            squeezed
+        } else if free >= fit + MAP_MIN_H {
+            full.max(free / 2).min(free - MAP_MIN_H)
+        } else {
+            squeezed
+        };
+        steps_h = steps_h.min(i.h - lanes_h);
+        fft::lanes(f, fv, Rect { x: i.x, y: i.y + i.h - lanes_h, w: i.w, h: lanes_h });
+    }
+    let map_h = i.h - steps_h - lanes_h;
     if let Some(m) = &v.map
         && m.total > 0
         && i.w >= MAP_MIN_W
-        && i.h >= v.plan.len() + MAP_MIN_H
+        && map_h >= MAP_MIN_H
     {
-        let y = i.y + v.plan.len();
+        let y = i.y + steps_h;
         for x in i.x - 1..i.x + 1 {
             f.set(x, y, '─', DarkGray, Black);
         }
@@ -750,12 +851,12 @@ fn plan(v: &View, f: &mut Frame, r: Rect) {
             i.x + 2
         };
         map::legend(f, m, x, i.x + i.w, y);
-        let area = Rect { x: i.x, y: y + 1, w: i.w, h: i.y + i.h - y - 1 };
+        let area = Rect { x: i.x, y: y + 1, w: i.w, h: map_h - 1 };
         map::draw(f, m, area, v.braille, v.elapsed_ms);
     }
     let running = v.plan.iter().position(|s| s.state == StepState::Running).unwrap_or(0);
-    let skip = (running + 1).saturating_sub(i.h);
-    for (n, s) in v.plan.iter().skip(skip).take(i.h).enumerate() {
+    let skip = (running + 1).saturating_sub(steps_h);
+    for (n, s) in v.plan.iter().skip(skip).take(steps_h).enumerate() {
         let y = i.y + n;
         let (mark, name_c) = match s.state {
             StepState::Running => ('►', White),
@@ -842,8 +943,12 @@ fn errors(v: &View, f: &mut Frame, r: Rect) {
     let total = v.mem_errors + v.cpu_errors;
     let badge = if total == 0 { (String::from("0"), LightGreen) } else { (group(total), LightRed) };
     let i = f.panel(r, "Errors", Some((&badge.0, badge.1)));
+    let wf = v.fft.as_ref().filter(|_| i.w >= WATERFALL_MIN_W);
     if total == 0 {
         f.text(i.x, i.y, "none", i.w, LightGreen, Black);
+        if let Some(fv) = wf {
+            fft::waterfall(f, fv, Rect { x: i.x, y: i.y + 2, w: i.w, h: i.h.saturating_sub(2) });
+        }
         return;
     }
     let mut y = i.y;
@@ -875,7 +980,14 @@ fn errors(v: &View, f: &mut Frame, r: Rect) {
             y += 1;
         }
     }
-    let room = (i.y + i.h).saturating_sub(y);
+    let mut room = (i.y + i.h).saturating_sub(y);
+    if let Some(fv) = wf
+        && room >= v.errors.len() + 1 + WATERFALL_MIN_H
+    {
+        let h = room - v.errors.len() - 1;
+        fft::waterfall(f, fv, Rect { x: i.x, y: i.y + i.h - h, w: i.w, h });
+        room -= h + 1;
+    }
     if room == 0 {
         return;
     }
@@ -893,6 +1005,10 @@ fn errors(v: &View, f: &mut Frame, r: Rect) {
         y += 1;
     }
 }
+
+/// The error waterfall's smallest size in the errors panel's free rows: narrower panels show none.
+const WATERFALL_MIN_W: usize = 48;
+const WATERFALL_MIN_H: usize = 5;
 
 /// Rows the errors panel keeps below the modules panel.
 const ERRORS_MIN_H: usize = 5;
@@ -972,18 +1088,27 @@ pub fn stuck_bits(bits: &[BitStat]) -> Option<String> {
 }
 
 fn remote(v: &View, f: &mut Frame, r: Rect) {
-    let Some(rem) = &v.remote else { return };
-    let i = f.panel(r, "Live view", None);
-    let Some(q) = &rem.qr else {
-        f.text(i.x, i.y, &rem.status, i.w, if rem.ok { LightGreen } else { LightGray }, Black);
-        return;
-    };
-    draw_qr(f, q, i.x + i.w.saturating_sub(q.size + 4) / 2, i.y);
-    let y = i.y + q.size.div_ceil(2) + 3;
-    f.text(i.x, y, &rem.url, i.w, LightCyan, Black);
-    f.text(i.x, y + 1, &rem.status, i.w, if rem.ok { LightGreen } else { DarkGray }, Black);
-    let top = y + 3;
-    v.fire.draw(f, Rect { x: i.x - 1, y: top, w: i.w + 2, h: (i.y + i.h).saturating_sub(top) });
+    let i = f.panel(r, if v.remote.is_some() { "Live view" } else { "Update" }, None);
+    let mut y = i.y;
+    let qr = v.remote.as_ref().and_then(|rem| {
+        let Some(q) = &rem.qr else {
+            f.text(i.x, i.y, &rem.status, i.w, if rem.ok { LightGreen } else { LightGray }, Black);
+            y += 2;
+            return None;
+        };
+        draw_qr(f, q, i.x + i.w.saturating_sub(q.size + 4) / 2, i.y);
+        y = i.y + q.size.div_ceil(2) + 3;
+        f.text(i.x, y, &rem.url, i.w, LightCyan, Black);
+        f.text(i.x, y + 1, &rem.status, i.w, if rem.ok { LightGreen } else { DarkGray }, Black);
+        y += 3;
+        Some(q)
+    });
+    if let Some(u) = &v.update {
+        y = update_lines(f, u, i.x, y, i.w) + 1;
+    }
+    if qr.is_some() {
+        v.fire.draw(f, Rect { x: i.x - 1, y, w: i.w + 2, h: (i.y + i.h).saturating_sub(y) });
+    }
 }
 
 /// Two modules per cell, dark on light, with a 2-module quiet zone.
@@ -1183,6 +1308,57 @@ mod tests {
         let mut f = Frame::new(100, 31);
         render(&v, &mut f);
         assert!(row_of(&f, 30).ends_with("Live: waiting for network "));
+    }
+
+    #[test]
+    fn update_lines_under_the_qr_code_or_alone() {
+        let mut v = sample();
+        v.update = Some(UpdateLine {
+            text: String::from("downloading 0.9.1"),
+            detail: String::from("12.3 of 35.1 MB"),
+            bar: Some((123, 351)),
+            tone: UpdateTone::Busy,
+        });
+        let find = |f: &Frame, s: &str| (0..f.h).find(|&y| row_of(f, y).contains(s));
+        let mut f = Frame::new(160, 50);
+        render(&v, &mut f);
+        let (url, text) = (find(&f, "reljam.com/m/ABCD1234").unwrap(), find(&f, "downloading 0.9.1").unwrap());
+        assert_eq!(text, url + 3);
+        assert_eq!(find(&f, "12.3 of 35.1 MB"), Some(text + 1));
+        v.remote = None;
+        let mut f = Frame::new(160, 50);
+        render(&v, &mut f);
+        assert!(row_of(&f, 3).contains("Update"));
+        assert_eq!(find(&f, "downloading 0.9.1"), Some(4));
+        let mut f = Frame::new(100, 31);
+        render(&v, &mut f);
+        assert!(row_of(&f, 30).ends_with("downloading 0.9.1  ·  12.3 of 35.1 MB "));
+    }
+
+    #[test]
+    fn progress_figure_and_map_share_the_sweep() {
+        let mut v = sample();
+        let chunk = |k: u64| crate::engine::Chunk {
+            ptr: ((1u64 << 32) + k * (256 << 20)) as *mut u64,
+            words: 32 << 20,
+            base: k * (32 << 20),
+        };
+        let mut m = MemMap::new(&[chunk(0), chunk(1)], 2);
+        m.phase(false);
+        v.map = Some(m);
+        if let Current::Mem { total, done, .. } = &mut v.current {
+            *total = 512 << 20;
+            *done = 0;
+        }
+        for bytes in [0, 96 << 20, 300 << 20, 512 << 20, 600 << 20] {
+            v.swept(bytes);
+            let (Some(m), Current::Mem { done, total, .. }) = (&v.map, &v.current) else { panic!() };
+            assert_eq!((m.swept.min(*total), m.total), (*done, *total));
+            let mut f = Frame::new(160, 50);
+            render(&v, &mut f);
+            let want = format!("{} / {}", gib(*done), gib(*total));
+            assert!((0..f.h).any(|y| row_of(&f, y).contains(&want)), "{want}");
+        }
     }
 
     fn row_of(f: &Frame, y: usize) -> String {

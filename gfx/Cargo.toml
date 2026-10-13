@@ -8,6 +8,11 @@ edition = "2024"
 memburn-core = { path = "../core" }
 fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
 libm = "0.2.16"
+qrcodegen = { version = "1.8", optional = true }
+
+[features]
+# Fixed dashboard states for tests and headless renders; needs std.
+fixtures = ["dep:qrcodegen"]
 
 [dev-dependencies]
 qrcodegen = "1.8"

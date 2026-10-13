@@ -5,8 +5,8 @@ Boot this stick from the PC's boot menu (often F8, F11 or F12). The GRUB menu of
   memburn bare-metal UEFI  needs Secure Boot off; tests nearly all RAM; no network
 
 Keys: Enter quick check, F full memory test, B burn-in, S stress (Linux entry), A all repeating,
-Esc stop, Q larger QR code, R restart, P power off.
-With a network the stick installs a newer signed release after the run; U starts it right away.
+Esc stop, Q larger QR code, R restart memburn, O reboot, P power off.
+With a network the stick installs a newer signed release after the run and R starts it; U starts it right away.
 
 With a wired network the screen shows a QR code and a reljam.com link to follow the run from a phone.
 Results: on screen, in memburn.log, and per-run bit statistics in memburn-history.txt at this stick's root.

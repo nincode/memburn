@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 use memburn_core::memtest::TestId;
 use memburn_core::smbios;
 use memburn_core::tui::{
-    self, Current, ErrKind, MemMap, Qr, RANGE_BYTES, Sample, StepState, Verdict, View, clock, group, tenths,
+    self, Current, ErrKind, MemMap, Qr, RANGE_BYTES, Sample, StepState, UpdateLine, UpdateTone, Verdict, View, clock,
+    group, tenths,
 };
 
 use crate::draw::{Pen, mix};
@@ -43,6 +44,8 @@ const L: f32 = 32.0;
 const FRESH_MS: u64 = 1500;
 
 use Face::*;
+
+mod fft;
 
 struct D<'p, 'a> {
     pen: &'p mut Pen<'a>,
@@ -180,6 +183,8 @@ pub fn paint(v: &View, pen: &mut Pen) {
     let middle = match &v.current {
         Current::Menu(_) => Middle::Menu,
         Current::Summary(_) => Middle::Summary,
+        Current::Burn { .. } if v.fft.is_some() => Middle::Fft,
+        _ if v.map.as_ref().is_some_and(|m| m.total > 0) && v.fft.is_some() => Middle::MapFft,
         _ if v.map.as_ref().is_some_and(|m| m.total > 0) => Middle::Map,
         _ => Middle::None,
     };
@@ -193,6 +198,21 @@ pub fn paint(v: &View, pen: &mut Pen) {
             Middle::Menu => menu_card(v, &mut d, r),
             Middle::Summary => summary_card(v, &mut d, r),
             Middle::Map => map_card(v, &mut d, r),
+            Middle::Fft | Middle::MapFft => {
+                let (x, y, w, h) = r;
+                let fv = v.fft.as_ref().expect("fft middle without fft");
+                if middle == Middle::MapFft {
+                    let mw = libm::roundf((w - 16.0) * 0.5);
+                    map_card(v, &mut d, (x, y, mw, h));
+                    fft::lanes(fv, &mut d, (x + mw + 16.0, y, w - mw - 16.0, h));
+                } else if w >= SPLIT_MIN_W {
+                    let lw = libm::roundf((w - 16.0) * 0.56);
+                    fft::lanes(fv, &mut d, (x, y, lw, h));
+                    fft::waterfall(fv, &mut d, (x + lw + 16.0, y, w - lw - 16.0, h));
+                } else {
+                    fft::lanes(fv, &mut d, r);
+                }
+            }
             Middle::None => {}
         }
         top + mid_h + 16.0
@@ -206,7 +226,14 @@ enum Middle {
     Menu,
     Summary,
     Map,
+    /// Burn-in: thread lanes and the error waterfall side by side.
+    Fft,
+    /// Stress: the memory map and the thread lanes.
+    MapFft,
 }
+
+/// Narrower middle cards show the thread lanes alone, points.
+const SPLIT_MIN_W: f32 = 1000.0;
 
 fn header(v: &View, d: &mut D) {
     let x = d.text(SansBold, 20.0, L, 38.0, "memburn", INK, 200.0);
@@ -626,7 +653,7 @@ fn callout(
 fn cards(v: &View, d: &mut D, y: f32, h: f32) {
     let inner = d.w - 2.0 * L;
     let mods = !v.dimms.is_empty();
-    let live = v.remote.is_some();
+    let live = v.remote.is_some() || v.update.is_some();
     let (mw, lw) = (196.0, 192.0);
     let fixed = if mods { mw + 16.0 } else { 0.0 } + if live { lw + 16.0 } else { 0.0 };
     let rest = inner - fixed - 16.0;
@@ -808,10 +835,20 @@ fn qr(d: &mut D, q: &Qr, x: f32, y: f32, size: f32) -> f32 {
     side as f32 / d.s
 }
 
+/// Room [`update_block`] takes under the live view's status line.
+const UPDATE_H: f32 = 48.0;
+
 fn live_card(v: &View, d: &mut D, (x, y, w, h): (f32, f32, f32, f32)) {
-    let Some(r) = &v.remote else { return };
+    let Some(r) = &v.remote else {
+        d.card(x, y, w, h, "Update");
+        if let Some(u) = &v.update {
+            update_block(d, u, x + 18.0, y + 54.0, w - 36.0);
+        }
+        return;
+    };
     d.card(x, y, w, h, "Live view");
-    let side = (w - 36.0).min(h - 134.0).max(40.0);
+    let extra = if v.update.is_some() { UPDATE_H } else { 0.0 };
+    let side = (w - 36.0).min(h - 134.0 - extra).max(40.0);
     let size = match &r.qr {
         Some(q) => qr(d, q, x + 18.0, y + 42.0, side),
         None => {
@@ -829,6 +866,33 @@ fn live_card(v: &View, d: &mut D, (x, y, w, h): (f32, f32, f32, f32)) {
     }
     d.circle(x + 22.0, ty - 4.5, 3.5, if r.ok { GREEN } else { DIM }, 255);
     d.text(Sans, 12.5, x + 32.0, ty, &r.status, MID, w - 50.0);
+    if let Some(u) = &v.update {
+        d.hline(x + 18.0, ty + 10.0, w - 36.0, HAIR);
+        update_block(d, u, x + 18.0, ty + 28.0, w - 36.0);
+    }
+}
+
+/// The update's text, detail and bar, the text's baseline at `y`.
+fn update_block(d: &mut D, u: &UpdateLine, x: f32, y: f32, w: f32) {
+    let c = match u.tone {
+        UpdateTone::Busy => INK,
+        UpdateTone::Ready => GREEN,
+        UpdateTone::Quiet => MID,
+        UpdateTone::Error => RED,
+    };
+    d.text(SansBold, 13.0, x, y, &u.text, c, w);
+    let ly = y + 18.0;
+    let Some(p) = u.percent() else {
+        d.text(Sans, 12.5, x, ly, &u.detail, MID, w);
+        return;
+    };
+    let dw = d.measure(Sans, 12.5, &u.detail);
+    d.text_r(Sans, 12.5, x + w, ly, &u.detail, MID);
+    let bw = (w - dw - 10.0).max(24.0);
+    d.rrect(x, ly - 7.0, bw, 5.0, 2.5, PENDING);
+    if p > 0 {
+        d.rrect(x, ly - 7.0, (bw * p as f32 / 100.0).max(5.0), 5.0, 2.5, CYAN);
+    }
 }
 
 fn zoom(d: &mut D, q: &Qr, url: &str, status: &str, ok: bool, y: f32, bottom: f32) {

@@ -1,5 +1,5 @@
 //! The dashboard as pixels for the stick's framebuffer and the UEFI GOP: same [`View`] as the text dashboard.
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "fixtures")), no_std)]
 
 extern crate alloc;
 
@@ -35,5 +35,7 @@ impl Painter {
     }
 }
 
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 #[cfg(test)]
 mod tests;

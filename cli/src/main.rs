@@ -24,17 +24,20 @@ use memburn_core::fft::{BurnError, BurnStats, Burner, Fault, MAX_ERR, MAX_LOG2N,
 use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
 use memburn_core::smbios;
-use memburn_core::tui::{self, Current, ErrKind, ErrLine, MemMap, Step, StepState, Verdict, View};
+use memburn_core::tui::{self, Current, ErrKind, ErrLine, FftView, MemMap, Step, StepState, Verdict, View};
 
 use term::Key;
 use ui::{Tone, Ui, errors_word};
 
-/// Exit codes the USB stick's init acts on.
-const EXIT_RESTART: u8 = 10;
+/// Exit codes the USB stick's init acts on: reboot and power off.
+const EXIT_REBOOT: u8 = 10;
 const EXIT_POWER_OFF: u8 = 11;
-/// Init runs the binary at [`update::NEXT`] with the same arguments and those in [`update::NEXT_ARGS`].
+/// Init runs the binary at [`update::NEXT`] with the same arguments and those in [`update::NEXT_ARGS`]; used when
+/// memburn cannot exec it itself.
 const EXIT_REEXEC: u8 = 12;
 const MENU_SECS: u32 = 10;
+/// Burn-in samples its lanes for the dashboard this often.
+const SAMPLE_EVERY: Duration = Duration::from_millis(100);
 /// Test memory shrinks by this much per retry when it cannot be locked.
 const LOCK_STEP: usize = 256 << 20;
 const EARLY_ROW: &str = "Kernel early test";
@@ -113,7 +116,7 @@ struct Args {
     /// With --stick: start a newer signed release as soon as it is downloaded and checked
     #[arg(long, hide = true)]
     update_auto: bool,
-    /// With --stick: no update check
+    /// With --stick: no update check until U
     #[arg(long, hide = true)]
     no_update: bool,
     /// Start this menu job: quick, full, burn, stress, cores or all
@@ -122,6 +125,9 @@ struct Args {
     /// This binary replaced that version in the running session
     #[arg(long, hide = true)]
     updated_from: Option<String>,
+    /// Start at the menu without a countdown
+    #[arg(long, hide = true)]
+    menu: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -285,6 +291,36 @@ impl Job {
         }
         v
     }
+
+    /// Rows of the memory test in [`Job::plan`]: one for stress, one per test otherwise.
+    fn mem_rows(&self) -> usize {
+        match (self.cores, self.stress) {
+            (Some(_), _) => 0,
+            (None, Some(_)) => 1,
+            (None, None) => self.tests.len(),
+        }
+    }
+
+    /// [`Job::plan`] with the kernel's early test as a done row after the memory test rows, when the job tests memory.
+    fn steps(&self, cpus: &[usize], early: Option<&EarlyTest>) -> Vec<Step> {
+        let mut v = self.plan(cpus);
+        if let Some(e) = early.filter(|_| !self.tests.is_empty()) {
+            v.insert(
+                self.mem_rows().min(v.len()),
+                Step {
+                    name: format!("{EARLY_ROW} {} patterns", e.patterns),
+                    note: String::new(),
+                    state: StepState::Done { ms: e.ms, errors: e.bad.len() as u64 },
+                },
+            );
+        }
+        v
+    }
+
+    /// Index of the burn-in row in [`Job::steps`].
+    fn burn_row(&self, early: bool) -> usize {
+        self.mem_rows() + usize::from(early && !self.tests.is_empty())
+    }
 }
 
 fn run(args: &Args) -> Result<u8, String> {
@@ -345,7 +381,10 @@ fn run(args: &Args) -> Result<u8, String> {
         out.upload(args.server.trim_end_matches('/').to_string());
     }
     let update = match &args.stick {
-        Some(stick) if args.boot && !args.no_update => {
+        Some(stick) if args.boot && args.no_update => {
+            Some(update::idle(args.server.trim_end_matches('/'), stick.clone()))
+        }
+        Some(stick) if args.boot => {
             let u = update::start(args.server.trim_end_matches('/'), stick.clone());
             if args.update_auto {
                 u.opt_in();
@@ -374,7 +413,7 @@ fn run(args: &Args) -> Result<u8, String> {
     }
 
     let plans = sizes.iter().map(|&s| Plan::new(s)).collect();
-    let (log, burn) = (ErrorLog::new(), BurnStats::default());
+    let (log, burn) = (ErrorLog::new(), BurnStats::with_lanes(threads));
     let mem = args.mem.trim();
     let mem_share = mem.ends_with('%') || mem.starts_with('-');
     let mem_floor = if mem.starts_with('-') { mem_bytes.min(parse_mem("95%")?) } else { mem_bytes };
@@ -427,7 +466,7 @@ fn run(args: &Args) -> Result<u8, String> {
     };
     let mut code = 0;
     let mut first = true;
-    let mut countdown = args.crash_log.is_none().then_some(MENU_SECS);
+    let mut countdown = (args.crash_log.is_none() && !args.menu).then_some(MENU_SECS);
     loop {
         let j = match job.take() {
             Some(j) => j,
@@ -437,12 +476,13 @@ fn run(args: &Args) -> Result<u8, String> {
                     c.out.close();
                     return Ok(n);
                 }
+                Pick::Restart => return Ok(restart(&mut c)),
             },
         };
         first = false;
         countdown = None;
         code = run_job(&mut c, &j)?;
-        if let Some(n) = start_update(&mut c, Some(&j)) {
+        if let Some(n) = start_update(&mut c, Some(&j), false) {
             c.out.close();
             return Ok(n);
         }
@@ -456,6 +496,7 @@ fn run(args: &Args) -> Result<u8, String> {
 enum Pick {
     Job(Job),
     Exit(u8),
+    Restart,
 }
 
 /// Swaps in a downloaded and checked update; the result screen's row for it.
@@ -463,7 +504,10 @@ fn install_update(c: &mut Ctx) -> Option<(String, String)> {
     let u = c.update.clone()?;
     let (line, row) = match u.install()? {
         Ok(v) if u.opted() => (format!("Updated to {v}, starting it"), format!("{v}, starting it")),
-        Ok(v) => (format!("Updated to {v}, used at the next boot"), format!("{v}, used at the next boot")),
+        Ok(v) if matches!(u.state(), update::State::Installed { next: update::Next::Reboot, .. }) => {
+            (format!("Updated to {v}, used at the next boot"), format!("{v}, used at the next boot"))
+        }
+        Ok(v) => (format!("Updated to {v}, starts on R"), format!("{v}, starts on R")),
         Err(e) => (format!("Update failed: {e}"), format!("failed: {e}")),
     };
     c.out.line(&line);
@@ -472,23 +516,20 @@ fn install_update(c: &mut Ctx) -> Option<(String, String)> {
     Some(("Update".into(), row))
 }
 
-/// Opted in and installed: hands the new version to init; the exit code that starts it.
-fn start_update(c: &mut Ctx, job: Option<&Job>) -> Option<u8> {
+/// Opted in and installed: starts the new version in this process, after `job` (to run it again) or at the menu
+/// (`no_countdown` without the countdown); the exit code when it cannot.
+fn start_update(c: &mut Ctx, job: Option<&Job>, no_countdown: bool) -> Option<u8> {
     let u = c.update.clone().filter(|u| u.opted())?;
     install_update(c);
     let update::State::Installed { version, next } = u.state() else { return None };
-    let stick = c.args.stick.clone()?;
-    let code = match next {
-        update::Next::Reexec { bin, sha256 } => {
-            let mut extra = vec!["--updated-from".to_string(), env!("CARGO_PKG_VERSION").to_string()];
-            if let Some(j) = job.filter(|j| !j.key.is_empty()) {
-                extra.extend(["--job".to_string(), j.key.to_string()]);
-            }
-            if update::hand_over(&stick, &bin, &sha256, &extra) { EXIT_REEXEC } else { EXIT_RESTART }
-        }
-        update::Next::Reboot => EXIT_RESTART,
-    };
-    let how = if code == EXIT_REEXEC { "starting it now" } else { "restarting" };
+    let mut extra = vec!["--updated-from".to_string(), env!("CARGO_PKG_VERSION").to_string()];
+    match job {
+        Some(j) if !j.key.is_empty() => extra.extend(["--job".to_string(), j.key.to_string()]),
+        None if no_countdown => extra.push("--menu".into()),
+        _ => {}
+    }
+    let keep_mode = job.is_some_and(|j| j.key.is_empty());
+    let how = if matches!(next, update::Next::Reexec { .. }) { "starting it now" } else { "rebooting" };
     c.out.line(&format!("Update {version}: {how}"));
     c.out.flush_log();
     c.out.view.verdict = Verdict::Menu(None);
@@ -496,7 +537,79 @@ fn start_update(c: &mut Ctx, job: Option<&Job>) -> Option<u8> {
     c.out.view.current = Current::Busy(format!("starting memburn {version}"));
     c.out.view.keys.clear();
     c.out.redraw_now();
-    Some(code)
+    let bin = match next {
+        update::Next::Reexec { bin, sha256 } => {
+            c.args.stick.as_ref().filter(|s| update::hand_over(s, &bin, &sha256, &extra))
+        }
+        update::Next::Reboot => None,
+    };
+    if bin.is_none() {
+        return Some(EXIT_REBOOT);
+    }
+    c.out.close();
+    let e = exec(std::path::Path::new(update::NEXT), keep_mode, &extra);
+    eprintln!("memburn {version} did not start: {e}");
+    Some(EXIT_REEXEC)
+}
+
+/// The R key: memburn again at the menu, the installed update's binary when there is one; the exit code when the
+/// exec fails.
+fn restart(c: &mut Ctx) -> u8 {
+    let mut extra = vec!["--menu".to_string()];
+    let mut bin = "/proc/self/exe";
+    if let Some(update::State::Installed { next: update::Next::Reexec { bin: new, sha256 }, .. }) =
+        c.update.as_ref().map(|u| u.state())
+    {
+        let with = [extra.clone(), vec!["--updated-from".into(), env!("CARGO_PKG_VERSION").into()]].concat();
+        if c.args.stick.as_ref().is_some_and(|s| update::hand_over(s, &new, &sha256, &with)) {
+            (bin, extra) = (update::NEXT, with);
+        }
+    }
+    c.out.close();
+    let e = exec(std::path::Path::new(bin), false, &extra);
+    eprintln!("memburn did not restart: {e}");
+    if bin == update::NEXT { EXIT_REEXEC } else { 0 }
+}
+
+/// Replaces this process with `bin`, given this run's arguments for a new start plus `extra`; returns the error
+/// when it cannot.
+fn exec(bin: &std::path::Path, keep_mode: bool, extra: &[String]) -> std::io::Error {
+    let args = restart_args(std::env::args().skip(1), keep_mode, extra);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new(bin).args(args).exec()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (bin, args);
+        std::io::Error::from(std::io::ErrorKind::Unsupported)
+    }
+}
+
+/// `args` without the options for the first start only (the job, unless `keep_mode` keeps `--mode`, the crash log
+/// and hook, the update notice, the menu flag), then `extra`.
+fn restart_args(mut args: impl Iterator<Item = String>, keep_mode: bool, extra: &[String]) -> Vec<String> {
+    let mut drop = vec!["--job", "--crash-log", "--crash-after", "--updated-from"];
+    if !keep_mode {
+        drop.extend(["--mode", "-m"]);
+    }
+    let mut out = Vec::new();
+    while let Some(a) = args.next() {
+        let name = a.split('=').next().unwrap_or_default();
+        if a == "--menu" {
+            continue;
+        }
+        if drop.contains(&name) {
+            if !a.contains('=') {
+                args.next();
+            }
+            continue;
+        }
+        out.push(a);
+    }
+    out.extend(extra.iter().cloned());
+    out
 }
 
 /// The menu item for the update: (key, label, note).
@@ -541,7 +654,7 @@ fn est(secs: f64) -> String {
 }
 
 /// Menu (with a countdown to the quick check, if any) or, after a run, the result screen with the same choices.
-fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, countdown: Option<u32>, last: u8) -> Pick {
+fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, mut countdown: Option<u32>, last: u8) -> Pick {
     let gib = c.mem_bytes as f64 / (1u64 << 30) as f64;
     let a = c.args;
     let [quick, full, burn, stress, cores, all] = menu_jobs(a, tests);
@@ -550,16 +663,13 @@ fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, countdown: Option<u32>, las
     let full_secs = sweep_secs(&full);
     let mut keys: Vec<(&'static str, &'static str)> =
         vec![("Enter", "quick"), ("F", "full memory"), ("B", "burn-in"), ("S", "stress"), ("C", "cores"), ("A", "all")];
-    if countdown.is_some() {
-        keys.clear();
-    }
     if a.boot {
-        keys.extend([("R", "restart"), ("P", "power off")]);
+        keys.extend([("R", "restart"), ("O", "reboot"), ("P", "power off")]);
     } else {
         keys.push(("X", "exit"));
     }
     let v = &mut c.out.view;
-    v.keys = keys;
+    v.keys = if countdown.is_some() { keys[6..].to_vec() } else { keys.clone() };
     v.qr_zoom = false;
     if menu {
         v.map = None;
@@ -576,9 +686,15 @@ fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, countdown: Option<u32>, las
         ]);
     }
     let t0 = Instant::now();
+    let opted = c.update.as_ref().is_some_and(|u| u.opted());
     loop {
         if let Some(u) = c.update.clone() {
-            if let Some(n) = start_update(c, None) {
+            if countdown.is_some() && !opted && u.opted() {
+                countdown = None;
+                c.out.view.verdict = Verdict::Menu(None);
+                c.out.view.keys = keys.clone();
+            }
+            if let Some(n) = start_update(c, None, countdown.is_none()) {
                 return Pick::Exit(n);
             }
             if !menu
@@ -606,7 +722,8 @@ fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, countdown: Option<u32>, las
             Some(Key::Char('S')) => return Pick::Job(stress),
             Some(Key::Char('C')) => return Pick::Job(cores),
             Some(Key::Char('A')) => return Pick::Job(all),
-            Some(Key::Char('R')) if a.boot => return Pick::Exit(EXIT_RESTART),
+            Some(Key::Char('R')) if a.boot => return Pick::Restart,
+            Some(Key::Char('O')) if a.boot => return Pick::Exit(EXIT_REBOOT),
             Some(Key::Char('P')) if a.boot => return Pick::Exit(EXIT_POWER_OFF),
             Some(Key::Char('X') | Key::Esc | Key::CtrlC) if !a.boot => return Pick::Exit(last),
             _ => {}
@@ -617,7 +734,7 @@ fn choose(c: &mut Ctx, tests: &[TestId], menu: bool, countdown: Option<u32>, las
 fn run_job(c: &mut Ctx, job: &Job) -> Result<u8, String> {
     c.stop.store(false, Ordering::Relaxed);
     c.log = ErrorLog::new();
-    c.burn = BurnStats::default();
+    c.burn = BurnStats::with_lanes(c.threads);
     c.out.reset();
     append_history(c, &history::start_line(&history::date(unix_now()), &job.name));
     if let Some(secs) = c.crash_after.take() {
@@ -628,17 +745,9 @@ fn run_job(c: &mut Ctx, job: &Job) -> Result<u8, String> {
     let v = &mut c.out.view;
     v.notice.clear();
     v.job = job.name.clone();
-    v.plan = job.plan(&c.cpus);
+    v.plan = job.steps(&c.cpus, c.early.as_ref());
     if let Some(e) = c.early.as_ref().filter(|_| !job.tests.is_empty()) {
         let errors = e.bad.len() as u64;
-        v.plan.insert(
-            job.tests.len(),
-            Step {
-                name: format!("{EARLY_ROW} {} patterns", e.patterns),
-                note: String::new(),
-                state: StepState::Done { ms: e.ms, errors },
-            },
-        );
         for &r in &e.bad {
             let module = v.suspect_range(r.0, r.1).unwrap_or_default();
             let text = format!("early: bad memory {}, reserved by the kernel", coverage::fmt_range(r));
@@ -692,8 +801,7 @@ fn run_job(c: &mut Ctx, job: &Job) -> Result<u8, String> {
         if let Some(d) = job.burn
             && !c.stop.load(Ordering::Relaxed)
         {
-            let early_row = c.early.is_some() && !job.tests.is_empty();
-            run_burn(c, d, job.tests.len() + usize::from(early_row));
+            run_burn(c, d, job.burn_row(c.early.is_some()));
         }
         cycle += 1;
     }
@@ -904,6 +1012,9 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
             let (halt, burn, isa, plans) = (&side_done, &c.burn, c.isa, &c.plans);
             side.spawn(move || Burner::new(isa, plans, i as u64).run(burn, halt));
         }
+        if stress.is_some() {
+            c.out.view.fft = Some(FftView::new(&c.burn, burn_threads, c.out.elapsed().as_millis() as u64));
+        }
         let mut shown = Instant::now();
         c.out.rebase(0, c.burn.flops.load(Ordering::Relaxed));
         let mut p = 0;
@@ -929,14 +1040,16 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                         let hs: Vec<_> = (0..mem_threads).map(|_| s.spawn(|| job_ph.work())).collect();
                         while !hs.iter().all(|h| h.is_finished()) {
                             std::thread::sleep(Duration::from_millis(2));
-                            if let Some(m) = &mut c.out.view.map {
-                                m.swept = moved.tested() - phase_start;
-                            }
+                            c.out.view.swept(moved.tested() - phase_start);
                             if c.out.tick().is_some() || shown.elapsed() < Duration::from_millis(250) {
                                 continue;
                             }
                             shown = Instant::now();
                             c.out.report(&c.log, &c.burn);
+                            let now_ms = c.out.elapsed().as_millis() as u64;
+                            if let Some(f) = &mut c.out.view.fft {
+                                f.sample(&c.burn, now_ms);
+                            }
                             let (d, m) = (moved.tested(), moved.traffic());
                             c.out.sample(Some(m), stress.map(|_| c.burn.flops.load(Ordering::Relaxed)));
                             let live = c.out.view.perf.mem.last().map_or(0.0, |&v| v as f64 * 1e6);
@@ -972,12 +1085,13 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                                 count: tests.len() as u32,
                                 step: r * t.phases() as u32 + ph as u32 + 1,
                                 steps: rounds * t.phases() as u32,
-                                done: (in_pass.min(per_pass) as u128 * tested as u128 / per_pass.max(1) as u128) as u64,
+                                done: 0,
                                 total: tested,
                                 left_ms: test_ms,
                                 job_left_ms: job_ms,
                                 job_label: if job.cycles == 0 { "cycle" } else { "job" },
                             };
+                            c.out.view.swept(d - phase_start);
                             let burn_part =
                                 if stress.is_some() { format!(" | {gflops:.1} GFLOP/s") } else { String::new() };
                             c.out.status(
@@ -998,9 +1112,7 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                             );
                         }
                     });
-                    if let Some(m) = &mut c.out.view.map {
-                        m.swept = moved.tested() - phase_start;
-                    }
+                    c.out.view.swept(moved.tested() - phase_start);
                     if over(c.stop) {
                         break;
                     }
@@ -1043,6 +1155,7 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
         }
         side_done.store(true, Ordering::Relaxed);
     });
+    c.out.view.fft = None;
     if stress.is_some() {
         let errors = c.log.count() + c.burn.errors.count();
         c.out.step(0, StepState::Done { ms: start.elapsed().as_millis() as u64, errors });
@@ -1079,10 +1192,15 @@ fn run_burn(c: &mut Ctx, dur: Duration, step: usize) {
             s.spawn(move || Burner::new(isa, plans, i as u64).run(burn, halt));
         }
         c.out.rebase(0, f0);
+        c.out.view.fft = Some(FftView::new(&c.burn, c.threads, c.out.elapsed().as_millis() as u64));
         let (mut last_t, mut last_f) = (t0, f0);
         loop {
-            c.out.wait_key(Duration::from_millis(250));
+            c.out.wait_key(SAMPLE_EVERY);
             c.out.report(&c.log, &c.burn);
+            let now_ms = c.out.elapsed().as_millis() as u64;
+            if let Some(f) = &mut c.out.view.fft {
+                f.sample(&c.burn, now_ms);
+            }
             let now = Instant::now();
             let el = now.duration_since(t0);
             if el >= dur || c.stop.load(Ordering::Relaxed) {
@@ -1123,6 +1241,7 @@ fn run_burn(c: &mut Ctx, dur: Duration, step: usize) {
             );
         }
     });
+    c.out.view.fft = None;
     c.out.report(&c.log, &c.burn);
     let secs = t0.elapsed().as_secs_f64();
     let errors = c.burn.errors.count() - e0;
@@ -1384,6 +1503,67 @@ mod tests {
         assert!(mem_bytes("--1G", avail).is_err());
         assert!(mem_bytes("-x", avail).is_err());
         assert!(Args::try_parse_from(["memburn", "--mem", "-512M"]).is_ok_and(|a| a.mem == "-512M"));
+    }
+
+    fn early() -> EarlyTest {
+        EarlyTest { patterns: 4, tested: Ranges::default(), bad: vec![(1 << 20, 2 << 20)], ms: 900 }
+    }
+
+    /// Every menu job and `--mode` job, built with and without the kernel's early test.
+    #[test]
+    fn plans_place_the_early_row_after_the_memory_rows() {
+        let a = Args::try_parse_from(["memburn"]).unwrap();
+        let tests = parse_tests(None).unwrap();
+        let cpus = [0, 1, 2, 3];
+        let modes = [Mode::Quick, Mode::Mem, Mode::Burn, Mode::Both, Mode::Stress, Mode::Cores];
+        let jobs = menu_jobs(&a, &tests).into_iter().chain(modes.map(|m| Job::from_mode(m, &a, &tests)));
+        let mut seen = 0;
+        for job in jobs {
+            let names = |e: Option<&EarlyTest>| -> Vec<String> {
+                job.steps(&cpus, e).into_iter().map(|s| s.name).collect::<Vec<_>>()
+            };
+            let (plain, with) = (names(None), names(Some(&early())));
+            let rows = if job.cores.is_some() { cpus.len() } else { job.mem_rows() + usize::from(job.burn.is_some()) };
+            assert_eq!(plain.len(), rows, "{}", job.name);
+            let at = with.iter().position(|n| n.starts_with(EARLY_ROW));
+            if job.tests.is_empty() {
+                assert_eq!(with, plain, "{}", job.name);
+            } else {
+                assert_eq!(at, Some(job.mem_rows()), "{}: {with:?}", job.name);
+                assert_eq!(with.len(), plain.len() + 1, "{}", job.name);
+            }
+            for e in [false, true] {
+                let steps = job.steps(&cpus, e.then(early).as_ref());
+                if job.burn.is_some() {
+                    assert_eq!(steps[job.burn_row(e)].name, "FFT burn-in", "{}", job.name);
+                    assert_eq!(job.burn_row(e), steps.len() - 1, "{}", job.name);
+                }
+                if job.stress.is_some() {
+                    assert_eq!(steps[0].name, "Memory test + FFT together", "{}", job.name);
+                }
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 12);
+    }
+
+    #[test]
+    fn restarts_drop_the_first_start_options() {
+        let init = "--boot --mode quick -d 0.5 --no-upload --mem -384M --crash-log c.txt --tag x --stick /stick \
+                    --log /stick/memburn.log --updated-from 0.8.0 --job stress --menu --crash-after=9";
+        let args = || init.split_whitespace().map(String::from);
+        let kept = "--boot -d 0.5 --no-upload --mem -384M --tag x --stick /stick --log /stick/memburn.log";
+        assert_eq!(restart_args(args(), false, &["--menu".into()]).join(" "), format!("{kept} --menu"));
+        let with_mode = "--boot --mode quick -d 0.5 --no-upload --mem -384M --tag x --stick /stick \
+                         --log /stick/memburn.log --updated-from 0.9.0";
+        let extra = ["--updated-from".into(), "0.9.0".into()];
+        assert_eq!(
+            restart_args(args(), true, &extra).join(" "),
+            with_mode.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        for a in [restart_args(args(), false, &[]), restart_args(args(), true, &[])] {
+            assert!(Args::try_parse_from(std::iter::once("memburn".to_string()).chain(a)).is_ok());
+        }
     }
 
     #[test]

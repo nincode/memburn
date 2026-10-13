@@ -31,7 +31,7 @@ use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
 use memburn_core::rng::splitmix64;
 use memburn_core::smbios;
-use memburn_core::tui::{self, Current, ErrLine, MemMap, Perf, Places, Step, StepState, Verdict, View};
+use memburn_core::tui::{self, Current, ErrLine, FftView, MemMap, Perf, Places, Step, StepState, Verdict, View};
 use uefi::boot;
 use uefi::fs::FileSystem;
 use uefi::prelude::*;
@@ -455,7 +455,7 @@ fn choose(ui: &mut Ui, cfg: &Config, countdown: bool) -> Option<Job> {
 }
 
 fn run_job(ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, plans: &[Plan], job: &Job) {
-    let sh = Shared { stop: AtomicBool::new(false), log: ErrorLog::new(), burn: BurnStats::default() };
+    let sh = Shared { stop: AtomicBool::new(false), log: ErrorLog::new(), burn: BurnStats::with_lanes(smp.cpus) };
     if let Err(e) = append_history(&history::start_line(&now(), job.name)) {
         ui.screen.log(format!("Could not update {}: {e}", history::FILE));
     }
@@ -674,7 +674,6 @@ fn test_passes(
 ) -> bool {
     let tested: u64 = chunks.iter().map(|c| c.words as u64 * 8).sum();
     let tests = &job.tests;
-    let per_pass = memtest::sweeps(tests) * tested;
     let pass_traffic = eta::pass_traffic(tests, tested);
     let pass_holds: u64 = tests.iter().map(|&(t, r)| eta::holds(t, r)).sum();
     let hold_ms = cfg.fade_secs * 1000;
@@ -711,10 +710,6 @@ fn test_passes(
                         return;
                     }
                     let d = moved.tested();
-                    if let Some(m) = ui.view.map.as_mut().filter(|_| row.is_none()) {
-                        m.swept = d - phase_start;
-                    }
-                    let in_pass = (d - (p * per_pass).min(d)).min(per_pass);
                     let m = moved.traffic();
                     let now_ms = clock.ms_since(ui.t0);
                     ui.rate.sample(now_ms, m);
@@ -742,17 +737,20 @@ fn test_passes(
                         count: tests.len() as u32,
                         step: r * t.phases() as u32 + ph as u32 + 1,
                         steps: rounds * t.phases() as u32,
-                        done: (in_pass as u128 * tested as u128 / per_pass.max(1) as u128) as u64,
+                        done: (d - phase_start).min(tested),
                         total: tested,
                         left_ms,
                         job_left_ms,
                         job_label,
                     };
+                    if row.is_none() {
+                        ui.view.swept(d - phase_start);
+                    }
                     ui.refresh(sh);
                 };
                 smp.run(&|_| pj.work(), || pj.work_one(), &mut tick);
-                if let Some(m) = ui.view.map.as_mut().filter(|_| row.is_none()) {
-                    m.swept = moved.tested() - phase_start;
+                if row.is_none() {
+                    ui.view.swept(moved.tested() - phase_start);
                 }
                 if sh.stop.load(Ordering::Relaxed) {
                     return false;
@@ -834,6 +832,7 @@ fn run_burn(sh: &Shared, ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, plans: 
     let clock = ui.clock;
     let limit_ms = secs * 1000;
     ui.rebase(f0);
+    ui.view.fft = Some(FftView::new(&sh.burn, smp.cpus, 0));
     let ap = |i: usize| unsafe { (*burners.0[i].get()).run(&sh.burn, &halt) };
     let bsp = || {
         unsafe { (*burners.0[0].get()).step(&sh.burn) };
@@ -847,6 +846,9 @@ fn run_burn(sh: &Shared, ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, plans: 
             return;
         }
         ui.sample(None, Some(sh.burn.flops.load(Ordering::Relaxed)));
+        if let Some(f) = &mut ui.view.fft {
+            f.sample(&sh.burn, clock.ms_since(t0));
+        }
         ui.view.current = Current::Burn {
             isa: isa.name(),
             threads: smp.cpus as u32,
@@ -859,6 +861,7 @@ fn run_burn(sh: &Shared, ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, plans: 
         ui.refresh(sh);
     };
     smp.run(&ap, bsp, tick);
+    ui.view.fft = None;
     ui.report(sh);
     let ms = clock.ms_since(t0);
     let errors = sh.burn.errors.count() - e0;

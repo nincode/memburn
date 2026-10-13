@@ -1,16 +1,18 @@
 # memburn
 
-Memory test and CPU burn-in on a bootable USB stick.
+Memory test and CPU burn-in on a bootable USB stick. Free and open source, MIT licence.
 
-- A quick check takes about 5 minutes.
-- It boots from a USB stick with Secure Boot on. Nothing is installed on the PC.
-- It uses every core and nearly all RAM.
-- With wired Ethernet, scan the QR code and watch the run on your phone.
-- Free and open source, MIT licence.
+![The pixel dashboard on the stick during a full memory test: the sweep crosses the memory map and finds flipped bits again in two ranges, marked red with the likely modules](docs/img/pixel-memtest.webp)
+
+**A fast, modern memory test.** Every core sweeps RAM in parallel: the quick check takes 3–5 minutes, the full test about 6 s per GiB. On single-socket AMD Ryzen and EPYC (Zen to Zen 3) it names the likely module. It boots with Secure Boot on and installs nothing on the PC.
+
+**CPU burn-in.** FFTs on every thread, each result checked: a wrong result points to the CPU, its cooling or its voltage, not just the RAM. Stress mode runs the memory test and the FFTs at the same time.
+
+![FFT burn-in on 32 threads: one lane per thread, the rounding error distribution, and CPU 6 returning a wrong result](docs/img/pixel-burn-in.webp)
+
+**Results on your phone.** With wired Ethernet, scan the QR code and watch the run live. The link works for 30 days; see [Privacy](#privacy).
 
 Download the stick image from [Releases](https://github.com/nincode/memburn/releases/latest) or https://reljam.com/memburn/.
-
-![The dashboard during a failing full memory test: 39 flipped bits in two places, red on the memory map](docs/img/dashboard-fail.webp)
 
 <p>
 <img src="docs/img/bg-failing-run.webp" alt="Photo of a failing run on a Ryzen 9 5950X with four DDR4 modules: 39 flipped bits in two places" width="70%">
@@ -19,7 +21,7 @@ Download the stick image from [Releases](https://github.com/nincode/memburn/rele
 
 ## Write the stick
 
-Any USB stick of 128 MB or more. Writing erases everything on it.
+Any USB stick of 128 MB or more. Writing erases everything on it. Step by step with screenshots: https://reljam.com/memburn/install
 
 | File | For |
 |---|---|
@@ -29,7 +31,7 @@ Any USB stick of 128 MB or more. Writing erases everything on it.
 
 **Windows, Rufus**
 
-1. Start [Rufus](https://rufus.ie). **Device**: pick the stick.
+1. Get Rufus from [rufus.ie](https://rufus.ie) only, or `winget install Rufus.Rufus`, and start it. **Device**: pick the stick.
 2. **Boot selection**: *Disk or ISO image*, then **SELECT** and choose `memburn-<version>-usb.img`.
 3. Click **START** and confirm that the stick will be erased.
 
@@ -75,7 +77,7 @@ A wrong disk name erases that disk. Check the size in `lsblk` or `diskutil list`
 |---|---|
 | Esc | stop the run after the current step |
 | Q | bigger or smaller QR code, once the Live view is up |
-| R / P | restart / power off, from the menu or result screen |
+| R / O / P | restart memburn / reboot / power off, from the menu or result screen |
 | U | update now, shown while a newer release downloads or waits |
 
 During memory tests the current-test panel shows the time left in the test and in the whole job, from the measured memory speed. The memory modules panel lists each module's slot, size, speed and part.
@@ -131,7 +133,9 @@ With a network each run gets a page at `reljam.com/m/<id>`, updated every 3 s. A
 
 ## Windows and Linux programs
 
-The same dashboard runs inside Windows or Linux. The OS keeps some RAM, so only the stick tests nearly all of it.
+The same tests run inside Windows or Linux, with the text dashboard in a terminal. The OS keeps some RAM, so only the stick tests nearly all of it.
+
+![The text dashboard during a failing full memory test: 39 flipped bits in two places, red on the memory map](docs/img/dashboard-fail.webp)
 
 **Windows**: run `memburn-<version>.exe` from an administrator terminal so it can lock test memory.
 

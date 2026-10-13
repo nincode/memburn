@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use memburn_proto::release::{self, Envelope, Manifest, StickFile};
 use sha2::{Digest, Sha256};
@@ -15,22 +15,27 @@ const REQUEST: Duration = Duration::from_secs(10);
 /// Retry delays after a failed check: doubling from the first to the last.
 const BACKOFF: (Duration, Duration) = (Duration::from_secs(2), Duration::from_secs(60));
 const ROUTE_POLL: Duration = Duration::from_secs(1);
+/// No route for this long counts as offline.
+const ROUTE_WAIT: Duration = Duration::from_secs(10);
 /// Free space kept on the stick beyond the new files.
 const SPARE: u64 = 1 << 20;
 const GRUB_CFGS: [&str; 2] = ["EFI/ubuntu/grub.cfg", "EFI/BOOT/grub.cfg"];
 const VERSIONS: &str = "EFI/memburn";
-/// The initramfs's init, compared with the release's `memburn-init`.
-const INIT: &str = "/init";
-/// Where the stick's init looks for the new memburn binary and its extra arguments (one per line) after exit 12.
+/// The new memburn binary, copied off the stick, and its extra arguments (one per line), which the stick's init
+/// also runs after exit 12.
 pub const NEXT: &str = "/memburn-next";
 pub const NEXT_ARGS: &str = "/memburn-next.args";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
-    /// Waiting for a network route or a server answer.
+    /// Waiting for a server answer.
     Checking,
-    /// No newer release, or the stick is not updatable.
+    /// No network route, or the server did not answer; retrying.
+    Offline,
+    /// The stick is not updatable or the server has no release.
     Nothing,
+    /// No newer release than this one.
+    UpToDate(String),
     /// The manifest failed its checks.
     Rejected(String),
     /// A newer release that does not fit on the stick.
@@ -39,6 +44,12 @@ pub enum State {
         version: String,
         done: u64,
         total: u64,
+    },
+    /// Reading the written files back from the stick and checking their hashes; `file` of `files` is done.
+    Verifying {
+        version: String,
+        file: usize,
+        files: usize,
     },
     Failed {
         version: String,
@@ -52,12 +63,12 @@ pub enum State {
     },
 }
 
-/// How the new version starts in this session.
+/// How the new version starts in this session; a new kernel and init start at the next boot.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Next {
-    /// Only memburn changed: init runs the new binary at `bin` (a stick path), hash `sha256`.
+    /// memburn runs the new binary at `bin` (a stick path), hash `sha256`, in its own place.
     Reexec { bin: PathBuf, sha256: String },
-    /// The kernel or init changed.
+    /// The release has no memburn binary.
     Reboot,
 }
 
@@ -71,24 +82,39 @@ pub struct Staged {
 }
 
 pub struct Updater {
-    state: Mutex<State>,
+    /// The state and when it was set.
+    state: Mutex<(State, Instant)>,
     opted: AtomicBool,
     stick: PathBuf,
+    /// The manifest URL.
+    url: String,
+    /// A check or download thread is running.
+    busy: AtomicBool,
 }
 
 impl Updater {
     pub fn state(&self) -> State {
-        self.state.lock().unwrap().clone()
+        self.state.lock().unwrap().0.clone()
+    }
+
+    /// Time since the state last changed.
+    pub fn age(&self) -> Duration {
+        self.state.lock().unwrap().1.elapsed()
     }
 
     fn set(&self, s: State) {
-        *self.state.lock().unwrap() = s;
+        let mut st = self.state.lock().unwrap();
+        if st.0 != s {
+            *st = (s, Instant::now());
+        }
     }
 
     /// The newer version U starts: downloading, ready, or installed for the next boot.
     pub fn offer(&self) -> Option<String> {
-        match &*self.state.lock().unwrap() {
-            State::Staging { version, .. } | State::Installed { version, .. } => Some(version.clone()),
+        match &self.state.lock().unwrap().0 {
+            State::Staging { version, .. } | State::Verifying { version, .. } | State::Installed { version, .. } => {
+                Some(version.clone())
+            }
             State::Ready(s) => Some(s.version.clone()),
             _ => None,
         }
@@ -103,18 +129,40 @@ impl Updater {
         self.opted.load(Ordering::Relaxed)
     }
 
+    /// No check is running and none would be refused for space: U starts one.
+    pub fn idle(&self) -> bool {
+        !self.busy.load(Ordering::Relaxed)
+            && self.offer().is_none()
+            && !matches!(self.state.lock().unwrap().0, State::NoSpace(_))
+    }
+
+    /// The U key acts: it opts in to an offered version or checks now.
+    pub fn takes_key(&self) -> bool {
+        (self.offer().is_some() && !self.opted()) || self.idle()
+    }
+
+    /// The U key: checks now, downloads, installs and starts a newer release; opts in to one already offered.
+    pub fn press(self: &Arc<Self>) {
+        if self.idle() {
+            self.opt_in();
+            self.check();
+        } else if self.offer().is_some() {
+            self.opt_in();
+        }
+    }
+
     /// Opted in and ready: the run should stop so the new version can start.
     pub fn due(&self) -> bool {
-        self.opted() && matches!(*self.state.lock().unwrap(), State::Ready(_))
+        self.opted() && matches!(self.state.lock().unwrap().0, State::Ready(_))
     }
 
     /// Swaps in a ready update; the new version, when it did.
     pub fn install(&self) -> Option<Result<String, String>> {
         let staged = {
             let mut s = self.state.lock().unwrap();
-            let State::Ready(st) = &*s else { return None };
+            let State::Ready(st) = &s.0 else { return None };
             let st = st.clone();
-            *s = State::Checking;
+            *s = (State::Checking, Instant::now());
             st
         };
         let result = swap(&self.stick, &staged);
@@ -126,26 +174,54 @@ impl Updater {
     }
 }
 
-/// Starts the background check of `{server}/memburn/api/latest` against the stick at `stick`; a newer release that
-/// fits is staged right away.
+/// An updater that checks `{server}/memburn/api/latest` against the stick at `stick` only when asked
+/// ([`Updater::press`], `update=off`).
+pub fn idle(server: &str, stick: PathBuf) -> Arc<Updater> {
+    Arc::new(Updater {
+        state: Mutex::new((State::Nothing, Instant::now())),
+        opted: AtomicBool::new(false),
+        stick,
+        url: format!("{server}/memburn/api/latest"),
+        busy: AtomicBool::new(false),
+    })
+}
+
+/// [`idle`] with the background check started; a newer release that fits is staged right away.
 pub fn start(server: &str, stick: PathBuf) -> Arc<Updater> {
-    let u = Arc::new(Updater { state: Mutex::new(State::Checking), opted: AtomicBool::new(false), stick });
-    let (w, url) = (u.clone(), format!("{server}/memburn/api/latest"));
-    std::thread::spawn(move || {
-        low_priority();
-        let m = match check(&url, &w.stick) {
+    let u = idle(server, stick);
+    u.check();
+    u
+}
+
+impl Updater {
+    /// Checks in a background thread, staging a newer release that fits.
+    fn check(self: &Arc<Self>) {
+        if self.busy.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.set(State::Checking);
+        let w = self.clone();
+        std::thread::spawn(move || {
+            low_priority();
+            w.run();
+            w.busy.store(false, Ordering::Relaxed);
+        });
+    }
+
+    fn run(&self) {
+        let m = match check(&self.url, &self.stick, &|s| self.set(s)) {
             Ok(m) => m,
-            Err(s) => return w.set(s),
+            Err(s) => return self.set(s),
         };
         let (version, total) = (m.version.clone(), m.tar.size);
-        let progress = |done| w.set(State::Staging { version: version.clone(), done, total });
+        let progress = |done| self.set(State::Staging { version: version.clone(), done, total });
+        let verify = |file, files| self.set(State::Verifying { version: version.clone(), file, files });
         progress(0);
-        w.set(match stage(&m, &w.stick, &progress, &booted()) {
+        self.set(match stage(&m, &self.stick, &progress, &verify) {
             Ok(s) => State::Ready(Box::new(s)),
             Err(error) => State::Failed { version, error },
         });
-    });
-    u
+    }
 }
 
 /// Nice 19 and idle I/O for the calling thread, so staging does not slow the test.
@@ -176,18 +252,25 @@ fn default_route(line: &str) -> bool {
     f.len() > 3 && f[1] == "00000000" && u32::from_str_radix(f[3], 16).is_ok_and(|flags| flags & 1 != 0)
 }
 
-/// The signed manifest, retried with backoff once a route exists until the server answers.
-fn fetch_manifest(url: &str) -> Result<Manifest, String> {
+/// The signed manifest, retried with backoff once a route exists until the server answers; `on` gets
+/// [`State::Offline`] while there is no route or answer and [`State::Checking`] while asking.
+fn fetch_manifest(url: &str, on: &dyn Fn(State)) -> Result<Manifest, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(REQUEST)).build().into();
     let mut delay = BACKOFF.0;
+    let t0 = Instant::now();
     let env: Envelope = loop {
         while !has_route() {
+            if t0.elapsed() >= ROUTE_WAIT {
+                on(State::Offline);
+            }
             std::thread::sleep(ROUTE_POLL);
         }
+        on(State::Checking);
         match agent.get(url).call() {
             Ok(mut r) => break r.body_mut().read_json().map_err(|e| format!("bad manifest: {e}"))?,
             Err(ureq::Error::StatusCode(c)) if c < 500 => return Err(format!("HTTP {c}")),
             Err(_) => {
+                on(State::Offline);
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(BACKOFF.1);
             }
@@ -197,15 +280,15 @@ fn fetch_manifest(url: &str) -> Result<Manifest, String> {
 }
 
 /// A newer release that fits on the stick, or the state to stop at.
-fn check(url: &str, stick: &Path) -> Result<Manifest, State> {
-    let manifest = match fetch_manifest(url) {
+fn check(url: &str, stick: &Path, on: &dyn Fn(State)) -> Result<Manifest, State> {
+    let manifest = match fetch_manifest(url, on) {
         Ok(m) => m,
         Err(e) if e.starts_with("HTTP ") => return Err(State::Nothing),
         Err(e) => return Err(State::Rejected(e)),
     };
     let Some(current) = installed(stick) else { return Err(State::Nothing) };
     if !release::newer(&manifest.version, env!("CARGO_PKG_VERSION")) || !release::newer(&manifest.version, &current) {
-        return Err(State::Nothing);
+        return Err(State::UpToDate(env!("CARGO_PKG_VERSION").into()));
     }
     let fits = crate::os::free_bytes(stick).is_none_or(|free| {
         let need: u64 = manifest
@@ -222,32 +305,11 @@ fn check(url: &str, stick: &Path) -> Result<Manifest, State> {
     Ok(manifest)
 }
 
-/// SHA-256 of the booted kernel and init, when known.
-#[derive(Default)]
-pub struct Booted {
-    kernel: Option<String>,
-    init: Option<String>,
-}
-
-fn booted() -> Booted {
-    let hash = |p: &Path| fs::read(p).ok().map(|d| release::sha256_hex(&d));
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let image = cmdline.split_whitespace().find_map(|a| a.strip_prefix("BOOT_IMAGE="));
-    Booted {
-        kernel: image.and_then(|i| hash(&Path::new("/stick").join(i.trim_start_matches('/')))),
-        init: hash(Path::new(INIT)),
-    }
-}
-
-/// Re-exec when the release has a memburn binary and the same kernel and init as booted.
-fn next(m: &Manifest, booted: &Booted) -> Next {
-    let file = |name: &str| m.files.iter().find(|f| f.path == format!("{VERSIONS}/{}/{name}", m.version));
-    let same = |name: &str, have: &Option<String>| file(name).zip(have.as_ref()).is_some_and(|(f, h)| f.sha256 == *h);
-    match file("memburn") {
-        Some(bin) if same("vmlinuz", &booted.kernel) && same("memburn-init", &booted.init) => {
-            Next::Reexec { bin: PathBuf::from(&bin.path), sha256: bin.sha256.clone() }
-        }
-        _ => Next::Reboot,
+/// Re-exec when the release has a memburn binary; it runs on the booted kernel and init.
+fn next(m: &Manifest) -> Next {
+    match m.files.iter().find(|f| f.path == format!("{VERSIONS}/{}/memburn", m.version)) {
+        Some(bin) => Next::Reexec { bin: PathBuf::from(&bin.path), sha256: bin.sha256.clone() },
+        None => Next::Reboot,
     }
 }
 
@@ -401,7 +463,7 @@ fn stage_from(
     stick: &Path,
     r: &mut dyn Read,
     progress: &dyn Fn(u64),
-    booted: &Booted,
+    verify: &dyn Fn(usize, usize),
 ) -> Result<Staged, String> {
     let (old_version, old_block) = fs::read_to_string(stick.join(GRUB_CFGS[1]))
         .ok()
@@ -513,6 +575,18 @@ fn stage_from(
         if let Some(f) = m.files.iter().find(|f| !seen.contains(&f.path.as_str())) {
             return Err(format!("{} missing", f.path));
         }
+        sync();
+        let files: Vec<&StickFile> =
+            written.iter().filter_map(|p| m.files.iter().find(|f| f.path == *p && !cfg(p))).collect();
+        verify(0, files.len());
+        for (k, f) in files.iter().enumerate() {
+            let p = staged(&f.path);
+            drop_cache(&p);
+            if file_sha(&p) != Some((f.size, f.sha256.clone())) {
+                return Err(format!("{}: reads back wrong", f.path));
+            }
+            verify(k + 1, files.len());
+        }
         Ok(())
     })();
     sync();
@@ -526,11 +600,23 @@ fn stage_from(
     }
     let (cfgs, mut paths): (Vec<String>, Vec<String>) = written.into_iter().partition(|p| cfg(p));
     paths.extend(cfgs);
-    Ok(Staged { version: m.version.clone(), old_version, paths, next: next(m, booted) })
+    Ok(Staged { version: m.version.clone(), old_version, paths, next: next(m) })
 }
 
-/// Downloads and stages `m` (see [`stage_from`]); `progress` gets the bytes downloaded.
-fn stage(m: &Manifest, stick: &Path, progress: &dyn Fn(u64), booted: &Booted) -> Result<Staged, String> {
+/// Drops `p`'s cached pages, so the next read comes from the stick.
+fn drop_cache(p: &Path) {
+    #[cfg(target_os = "linux")]
+    if let Ok(f) = fs::File::open(p) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = p;
+}
+
+/// Downloads and stages `m` (see [`stage_from`]); `progress` gets the bytes downloaded, `verify` the files
+/// read back of all.
+fn stage(m: &Manifest, stick: &Path, progress: &dyn Fn(u64), verify: &dyn Fn(usize, usize)) -> Result<Staged, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_body(Some(Duration::from_secs(1800)))
@@ -538,7 +624,7 @@ fn stage(m: &Manifest, stick: &Path, progress: &dyn Fn(u64), booted: &Booted) ->
         .into();
     let mut r = agent.get(&m.tar.url).call().map_err(|e| format!("download: {e}"))?;
     let mut body = r.body_mut().with_config().limit(m.tar.size + 1).reader();
-    stage_from(m, stick, &mut body, progress, booted)
+    stage_from(m, stick, &mut body, progress, verify)
 }
 
 /// Renames the staged files over the stick's, grub.cfg last, then removes versions older than the previous one.
@@ -554,7 +640,7 @@ fn swap(stick: &Path, s: &Staged) -> Result<(), String> {
     Ok(())
 }
 
-/// Copies the new binary of a [`Next::Reexec`] to [`NEXT`] with `args` for init; false if it does not check out.
+/// Copies the new binary of a [`Next::Reexec`] to [`NEXT`] and `args` to [`NEXT_ARGS`]; false if it does not check out.
 pub fn hand_over(stick: &Path, bin: &Path, sha256: &str, args: &[String]) -> bool {
     let tmp = format!("{NEXT}.tmp");
     let ok = fs::copy(stick.join(bin), &tmp).is_ok()
@@ -600,6 +686,32 @@ mod tests {
         }
         out.extend_from_slice(&[0; 1024]);
         out
+    }
+
+    #[test]
+    fn update_off_checks_only_on_u() {
+        let u = idle("http://127.0.0.1:9", PathBuf::from("/nonexistent"));
+        assert_eq!(u.state(), State::Nothing);
+        assert!(u.idle() && u.takes_key() && !u.opted());
+        assert!(!u.busy.load(Ordering::Relaxed), "no thread before U");
+        u.press();
+        assert!(u.opted());
+        assert!(!u.idle() && !u.takes_key(), "U does nothing while the check runs");
+        assert!(matches!(u.state(), State::Checking | State::Offline | State::Nothing));
+    }
+
+    #[test]
+    fn u_opts_in_to_an_offer_and_rechecks_after_the_answer() {
+        let u = idle("http://127.0.0.1:9", PathBuf::from("/nonexistent"));
+        u.set(State::Staging { version: "9.0.0".into(), done: 1, total: 2 });
+        assert!(!u.idle() && u.takes_key());
+        u.press();
+        assert!(u.opted() && !u.takes_key());
+        assert!(!u.busy.load(Ordering::Relaxed), "an offer is not checked again");
+        u.set(State::UpToDate("0.9.1".into()));
+        assert!(u.idle() && u.takes_key());
+        u.set(State::NoSpace("9.0.0".into()));
+        assert!(!u.idle() && !u.takes_key());
     }
 
     #[test]
@@ -682,17 +794,16 @@ mod tests {
         out
     }
 
-    fn booted_as(kernel: &[u8], init: &[u8]) -> Booted {
-        Booted { kernel: Some(release::sha256_hex(kernel)), init: Some(release::sha256_hex(init)) }
-    }
-
     #[test]
     fn staged_files_swap_in_and_keep_the_previous_version() {
         let (stick, m, t) = setup("ok", false);
         let before = snapshot(&stick);
         let last = std::cell::Cell::new(0);
-        let s = stage_from(&m, &stick, &mut &t[..], &|d| last.set(d), &booted_as(b"kernel", b"init")).unwrap();
+        let checked = std::cell::RefCell::new(Vec::new());
+        let s =
+            stage_from(&m, &stick, &mut &t[..], &|d| last.set(d), &|k, n| checked.borrow_mut().push((k, n))).unwrap();
         assert!(last.get() > 0 && last.get() <= t.len() as u64);
+        assert_eq!(*checked.borrow(), [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]);
         let read = |p: &str| fs::read_to_string(stick.join(p)).unwrap_or_default();
         assert_eq!(read("EFI/memburn/0.5.1/vmlinuz.new"), "kernel");
         assert!(!stick.join("windows/memburn.exe.new").exists());
@@ -721,13 +832,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_kernel_or_init_reboots() {
+    fn only_a_release_without_memburn_reboots() {
         let (stick, m, _) = setup("next", false);
-        assert_eq!(next(&m, &booted_as(b"other kernel", b"init")), Next::Reboot);
-        assert_eq!(next(&m, &booted_as(b"kernel", b"other init")), Next::Reboot);
-        assert_eq!(next(&m, &Booted::default()), Next::Reboot);
+        let bin = Next::Reexec { bin: "EFI/memburn/0.5.1/memburn".into(), sha256: release::sha256_hex(&[9u8; 700]) };
+        assert_eq!(next(&m), bin);
         let old = Manifest { files: m.files.iter().filter(|f| !f.path.ends_with("/memburn")).cloned().collect(), ..m };
-        assert_eq!(next(&old, &booted_as(b"kernel", b"init")), Next::Reboot);
+        assert_eq!(next(&old), Next::Reboot);
         let _ = fs::remove_dir_all(stick);
     }
 
@@ -735,7 +845,7 @@ mod tests {
     fn a_bad_hash_leaves_the_stick_unchanged() {
         let (stick, m, t) = setup("hash", true);
         let before = snapshot(&stick);
-        let r = stage_from(&m, &stick, &mut &t[..], &|_| {}, &Booted::default());
+        let r = stage_from(&m, &stick, &mut &t[..], &|_| {}, &|_, _| {});
         assert_eq!(r, Err("EFI/memburn/0.5.1/vmlinuz: hash mismatch".into()));
         assert_eq!(snapshot(&stick), before);
         let _ = fs::remove_dir_all(stick);
@@ -745,12 +855,12 @@ mod tests {
     fn a_short_or_bad_download_leaves_the_stick_unchanged() {
         let (stick, m, t) = setup("short", false);
         let before = snapshot(&stick);
-        let r = stage_from(&m, &stick, &mut &t[..t.len() - 1500], &|_| {}, &Booted::default());
+        let r = stage_from(&m, &stick, &mut &t[..t.len() - 1500], &|_| {}, &|_, _| {});
         assert_eq!(r, Err("truncated download".into()));
         assert_eq!(snapshot(&stick), before);
         let mut bad = t.clone();
         bad[t.len() - 1] = 1;
-        let r = stage_from(&m, &stick, &mut &bad[..], &|_| {}, &Booted::default());
+        let r = stage_from(&m, &stick, &mut &bad[..], &|_| {}, &|_, _| {});
         assert_eq!(r, Err("download: hash mismatch".into()));
         assert_eq!(snapshot(&stick), before);
         let _ = fs::remove_dir_all(stick);

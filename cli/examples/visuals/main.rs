@@ -1,11 +1,15 @@
 //! Renders of the shipped text dashboard (`5-*`) and the #37 prototypes as PNG stills and GIFs via ffmpeg.
 //! `cargo run --release -p memburn --example visuals -- <dir> [name-filter]`
+//! `cargo run --release -p memburn --example visuals -- <dir> states [name-filter]`: every fixture state as PNG
+//! `cargo run --release -p memburn --example visuals -- <dir> anim [name-filter]`: animated pixel dashboard WebPs
 #![allow(clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::needless_range_loop)]
+mod anim;
 mod deco;
 mod map;
 mod pixel;
 mod raster;
 mod scene;
+mod states;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -206,6 +210,12 @@ fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "target/visuals".into());
     let only = std::env::args().nth(2).unwrap_or_default();
     std::fs::create_dir_all(&dir).unwrap();
+    if only == "states" {
+        return states::run(&dir, &std::env::args().nth(3).unwrap_or_default());
+    }
+    if only == "anim" {
+        return anim::run(&dir, &std::env::args().nth(3).unwrap_or_default());
+    }
     let text: [(&str, usize, usize, Overlay); 8] = [
         ("1a-map-halfblock-errors", 160, 50, o1a),
         ("1b-map-braille-plan", 160, 50, o1b),

@@ -8,18 +8,20 @@ use std::time::{Duration, Instant};
 use memburn_core::errlog::{self, ErrorLog, MemError};
 use memburn_core::fft::{BurnError, BurnStats, Fault};
 use memburn_core::history::History;
-use memburn_core::tui::{self, ErrLine, Frame, Places, Qr, Remote, StepState, Verdict, View};
+use memburn_core::tui::{self, ErrLine, Frame, Places, Qr, Remote, StepState, UpdateLine, UpdateTone, Verdict, View};
 use memburn_proto::Snapshot;
 
 use crate::os;
 use crate::term::{Key, Term};
-use crate::update::{State, Updater};
+use crate::update::{Next, State, Updater};
 use crate::upload::{Phase, Uploader};
 
 const DRAW_EVERY: Duration = Duration::from_millis(100);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const PUSH_EVERY: Duration = Duration::from_secs(3);
 const MAX_ERR_LINES: usize = 500;
+/// "up to date" stays in the panel this long.
+const UP_TO_DATE_SHOWN: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 pub enum Tone {
@@ -366,9 +368,9 @@ impl Ui {
                         self.view.verdict = Verdict::Stopping;
                         self.drawn = None;
                     }
-                    Key::Char('U') if self.updater.as_ref().is_some_and(|u| u.offer().is_some() && !u.opted()) => {
+                    Key::Char('U') if self.updater.as_ref().is_some_and(|u| u.takes_key()) => {
                         if let Some(u) = &self.updater {
-                            u.opt_in();
+                            u.press();
                         }
                         self.drawn = None;
                     }
@@ -384,10 +386,11 @@ impl Ui {
         other
     }
 
-    /// Logs the update's progress once per step, keeps the U key in the footer while one is on offer, and stops
-    /// a run once an opted-in update is ready.
+    /// Logs the update's progress once per step, keeps the U key in the footer while one is on offer or, on the
+    /// menu and result screens, while U would check, and stops a run once an opted-in update is ready.
     fn sync_update(&mut self) {
         let Some(u) = self.updater.clone() else { return };
+        self.view.update = update_line(&u.state(), u.opted(), u.age());
         let said = match u.state() {
             State::Rejected(e) => format!("Update check: rejected, {e}"),
             State::NoSpace(v) => format!("Update available: {v}, too little space on the stick: re-flash needed"),
@@ -418,6 +421,8 @@ impl Ui {
                 };
                 self.view.keys.insert(0, ("U", labels[k]));
             }
+        } else if u.idle() && !matches!(self.view.verdict, Verdict::Running | Verdict::Stopping) {
+            self.view.keys.push(("U", "update"));
         }
         if self.view.verdict == Verdict::Running && u.due() {
             self.stop.store(true, Ordering::Relaxed);
@@ -496,11 +501,58 @@ impl Ui {
     }
 
     /// Sends the final snapshot unless sent, and restores the terminal.
-    pub fn close(mut self) {
+    pub fn close(&mut self) {
         self.finish();
-        self.close_screen();
         if let Some(up) = self.up.take() {
             up.wait(Duration::from_secs(10));
+        }
+        self.close_screen();
+    }
+}
+
+/// The panel's lines for the updater's state; `age` is how long it has been in it.
+pub fn update_line(s: &State, opted: bool, age: Duration) -> Option<UpdateLine> {
+    let line = |text: String, detail: String, bar: Option<(u64, u64)>, tone: UpdateTone| {
+        Some(UpdateLine { text, detail, bar, tone })
+    };
+    let mb = |b: u64| format!("{:.1}", b as f64 / 1e6);
+    let none = String::new;
+    match s {
+        State::Checking => line("checking for updates".into(), none(), None, UpdateTone::Busy),
+        State::Offline => line("update check".into(), "offline".into(), None, UpdateTone::Error),
+        State::Nothing => None,
+        State::UpToDate(v) if age < UP_TO_DATE_SHOWN => {
+            line(format!("up to date ({v})"), none(), None, UpdateTone::Quiet)
+        }
+        State::UpToDate(_) => None,
+        State::Rejected(e) => line("update check".into(), e.clone(), None, UpdateTone::Error),
+        State::NoSpace(v) => line(format!("{v} available"), "no space on the stick".into(), None, UpdateTone::Error),
+        State::Staging { version, done, total } => line(
+            format!("downloading {version}"),
+            format!("{} of {} MB", mb(*done), mb(*total)),
+            Some((*done, *total)),
+            UpdateTone::Busy,
+        ),
+        State::Verifying { version, file, files } => line(
+            format!("verifying {version}"),
+            format!("file {} of {files}", (*file + 1).min(*files)),
+            Some((*file as u64, *files as u64)),
+            UpdateTone::Busy,
+        ),
+        State::Failed { version, error } => {
+            line(format!("update to {version} failed"), error.clone(), None, UpdateTone::Error)
+        }
+        State::Ready(st) => {
+            let detail = if opted { "starting" } else { "U to start now" };
+            line(format!("{} ready", st.version), detail.into(), None, UpdateTone::Ready)
+        }
+        State::Installed { version, next } => {
+            let detail = match next {
+                _ if opted => "starting",
+                Next::Reexec { .. } => "starts on R",
+                Next::Reboot => "starts at the next boot",
+            };
+            line(format!("{version} installed"), detail.into(), None, UpdateTone::Ready)
         }
     }
 }
@@ -540,5 +592,72 @@ fn sync_qr_key(v: &mut View) {
         }
         None if has && matches!(v.verdict, Verdict::Running | Verdict::Stopping) => v.keys.push(("Q", label)),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shown(s: State, opted: bool, age: u64) -> Option<(String, String, Option<u64>, UpdateTone)> {
+        let u = update_line(&s, opted, Duration::from_secs(age))?;
+        Some((u.text.clone(), u.detail.clone(), u.percent(), u.tone))
+    }
+
+    #[test]
+    fn u_key_with_update_off() {
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let mut ui = Ui::new(false, View::default(), &STOP);
+        ui.updater = Some(crate::update::idle("http://127.0.0.1:9", "/nonexistent".into()));
+        let has_u = |ui: &Ui| ui.view.keys.iter().find(|k| k.0 == "U").map(|k| k.1);
+        for (verdict, shown) in [
+            (Verdict::Menu(None), Some("update")),
+            (Verdict::Pass, Some("update")),
+            (Verdict::Stopped, Some("update")),
+            (Verdict::Running, None),
+        ] {
+            ui.view.verdict = verdict;
+            ui.sync_update();
+            assert_eq!(has_u(&ui), shown);
+            assert_eq!(ui.view.update, None, "nothing in the panel before U");
+        }
+        ui.view.verdict = Verdict::Menu(None);
+        ui.updater.as_ref().unwrap().press();
+        ui.sync_update();
+        assert_eq!(has_u(&ui), None);
+        assert!(ui.view.update.is_some());
+    }
+
+    #[test]
+    fn update_states_in_the_panel() {
+        let t = |a: &str, b: &str, p: Option<u64>, tone| Some((a.to_string(), b.to_string(), p, tone));
+        use UpdateTone::*;
+        assert_eq!(shown(State::Checking, false, 0), t("checking for updates", "", None, Busy));
+        assert_eq!(shown(State::Offline, false, 0), t("update check", "offline", None, Error));
+        assert_eq!(shown(State::Nothing, false, 0), None);
+        assert_eq!(shown(State::UpToDate("0.9.0".into()), false, 3), t("up to date (0.9.0)", "", None, Quiet));
+        assert_eq!(shown(State::UpToDate("0.9.0".into()), false, 11), None);
+        assert_eq!(
+            shown(State::Rejected("bad signature".into()), false, 0),
+            t("update check", "bad signature", None, Error)
+        );
+        assert_eq!(
+            shown(State::NoSpace("0.9.0".into()), false, 0),
+            t("0.9.0 available", "no space on the stick", None, Error)
+        );
+        let staging = State::Staging { version: "0.9.0".into(), done: 12_300_000, total: 35_100_000 };
+        assert_eq!(shown(staging, false, 0), t("downloading 0.9.0", "12.3 of 35.1 MB", Some(35), Busy));
+        let verifying = State::Verifying { version: "0.9.0".into(), file: 3, files: 13 };
+        assert_eq!(shown(verifying, false, 0), t("verifying 0.9.0", "file 4 of 13", Some(23), Busy));
+        let done = State::Verifying { version: "0.9.0".into(), file: 13, files: 13 };
+        assert_eq!(shown(done, false, 0), t("verifying 0.9.0", "file 13 of 13", Some(100), Busy));
+        let failed = State::Failed { version: "0.9.0".into(), error: "download: hash mismatch".into() };
+        assert_eq!(shown(failed, false, 0), t("update to 0.9.0 failed", "download: hash mismatch", None, Error));
+        let bin = Next::Reexec { bin: "EFI/memburn/0.9.0/memburn".into(), sha256: String::new() };
+        let installed = |next: &Next| State::Installed { version: "0.9.0".into(), next: next.clone() };
+        assert_eq!(shown(installed(&bin), false, 0), t("0.9.0 installed", "starts on R", None, Ready));
+        assert_eq!(shown(installed(&bin), true, 0), t("0.9.0 installed", "starting", None, Ready));
+        let boot = installed(&Next::Reboot);
+        assert_eq!(shown(boot, false, 0), t("0.9.0 installed", "starts at the next boot", None, Ready));
     }
 }

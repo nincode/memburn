@@ -734,7 +734,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "memburn"
-version = "0.9.0"
+version = "0.9.3"
 dependencies = [
  "clap",
  "crossterm",
@@ -754,14 +754,14 @@ dependencies = [
 
 [[package]]
 name = "memburn-core"
-version = "0.9.0"
+version = "0.9.3"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "memburn-gfx"
-version = "0.9.0"
+version = "0.9.3"
 dependencies = [
  "fontdue",
  "libm",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "memburn-proto"
-version = "0.9.0"
+version = "0.9.3"
 dependencies = [
  "ed25519-dalek",
  "memburn-core",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "memburn-uefi"
-version = "0.9.0"
+version = "0.9.3"
 dependencies = [
  "memburn-core",
  "memburn-gfx",

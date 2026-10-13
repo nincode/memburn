@@ -1,6 +1,8 @@
 pub mod kernels;
+pub mod lane;
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
+use alloc::vec::Vec;
 use core::fmt;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,13 +11,14 @@ use crate::cpu::Isa;
 use crate::errlog::Ring;
 use crate::rng::Rng;
 use kernels::MAGIC;
+pub use lane::Lane;
 
 pub const MIN_LOG2N: u32 = 4;
 pub const MAX_LOG2N: u32 = 24;
 pub const MAX_ERR: f64 = 0.4;
 const MAX_ERR_BITS: u64 = MAX_ERR.to_bits();
 /// Flops each burner spends on one FFT size before moving to the next.
-const SLICE_FLOPS: u64 = 20_000_000_000;
+pub const SLICE_FLOPS: u64 = 20_000_000_000;
 
 /// 64-byte aligned, zeroed f64 buffer.
 pub struct Buf {
@@ -131,6 +134,18 @@ impl Outcome {
     pub fn ok(&self) -> bool {
         self.sums_ok && !self.non_finite && self.max_err <= MAX_ERR_BITS
     }
+
+    pub fn fault(&self) -> Option<Fault> {
+        if self.non_finite {
+            Some(Fault::NonFinite)
+        } else if !self.sums_ok {
+            Some(Fault::WrongResult)
+        } else if self.max_err > MAX_ERR_BITS {
+            Some(Fault::Rounding)
+        } else {
+            None
+        }
+    }
 }
 
 /// Squares random balanced digits by FFT convolution; checks rounding, sum and alternating-sum identities.
@@ -201,6 +216,17 @@ pub enum Fault {
     NonFinite,
 }
 
+impl Fault {
+    /// 1.., so that 0 can stand for none.
+    pub fn code(self) -> u32 {
+        self as u32 + 1
+    }
+
+    pub fn from_code(c: u32) -> Option<Fault> {
+        [Fault::WrongResult, Fault::Rounding, Fault::NonFinite].get((c as usize).wrapping_sub(1)).copied()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BurnError {
     pub worker: u32,
@@ -233,6 +259,8 @@ pub struct BurnStats {
     pub errors: Ring<BurnError, 16>,
     /// Self-test: the next FFT any burner runs gets a corrupted value.
     pub inject: AtomicBool,
+    /// Per-burner figures for the dashboard, indexed by worker; empty when nothing draws them.
+    pub lanes: Vec<Lane>,
 }
 
 impl Default for BurnStats {
@@ -243,25 +271,25 @@ impl Default for BurnStats {
             max_err: AtomicU64::new(0),
             errors: Ring::new(BurnError { worker: 0, log2n: 0, seed: 0, fault: Fault::WrongResult, max_err: 0 }),
             inject: AtomicBool::new(false),
+            lanes: Vec::new(),
         }
     }
 }
 
 impl BurnStats {
+    /// Stats with a [`Lane`] for each of workers `0..n`.
+    pub fn with_lanes(n: usize) -> Self {
+        BurnStats { lanes: (0..n).map(|_| Lane::default()).collect(), ..BurnStats::default() }
+    }
+
     fn record(&self, plan: &Plan, worker: u32, seed: u64, o: &Outcome) {
         self.iters.fetch_add(1, Ordering::Relaxed);
         self.flops.fetch_add(plan.flops(), Ordering::Relaxed);
-        if o.ok() {
-            self.max_err.fetch_max(o.max_err, Ordering::Relaxed);
-        } else {
-            let fault = if o.non_finite {
-                Fault::NonFinite
-            } else if !o.sums_ok {
-                Fault::WrongResult
-            } else {
-                Fault::Rounding
-            };
-            self.errors.record(BurnError { worker, log2n: plan.log2n, seed, fault, max_err: o.max_err });
+        match o.fault() {
+            None => {
+                self.max_err.fetch_max(o.max_err, Ordering::Relaxed);
+            }
+            Some(fault) => self.errors.record(BurnError { worker, log2n: plan.log2n, seed, fault, max_err: o.max_err }),
         }
     }
 }
@@ -296,6 +324,9 @@ impl<'a> Burner<'a> {
         let o = run(self.isa, plan, &mut self.work, self.seed, fault);
         stats.record(plan, self.worker, self.seed, &o);
         self.left = self.left.saturating_sub(plan.flops());
+        if let Some(l) = stats.lanes.get(self.worker as usize) {
+            l.record(plan, &o, SLICE_FLOPS - self.left);
+        }
         if self.left == 0 {
             self.plan = (self.plan + 1) % self.plans.len();
             self.left = SLICE_FLOPS;

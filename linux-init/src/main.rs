@@ -26,7 +26,7 @@ mod linux {
     const MARKER: &str = "/stick/EFI/memburn";
     const LOG: &str = "/stick/memburn.log";
     const PSTORE: &str = "/sys/fs/pstore";
-    /// memburn exit codes for the Restart and Power off keys.
+    /// memburn exit codes for the Reboot and Power off keys.
     const EXIT_RESTART: i32 = 10;
     const EXIT_POWER_OFF: i32 = 11;
     /// memburn left a new binary at NEXT and extra arguments, one per line, at NEXT_ARGS.
@@ -121,14 +121,17 @@ mod linux {
             tags.push("no log: stick not found".into());
         }
         let mut unattended = cfg.map(|text| translate(&text, crash_log.is_none()));
+        let mut later = unattended.as_ref().map(|(args, _)| without_job(args));
         let mut crash_log = crash_log;
         let mut bin = MEMBURN;
         let mut again: Option<(Vec<String>, bool)> = None;
         let mut extra: Vec<String> = Vec::new();
         loop {
             let (args, shutdown) = again.take().unwrap_or_else(|| {
-                let (mut args, shutdown) =
-                    unattended.take().unwrap_or_else(|| (vec!["--mem".into(), DEFAULT_MEM.into()], false));
+                let (mut args, shutdown) = unattended
+                    .take()
+                    .or_else(|| Some((later.clone()?, false)))
+                    .unwrap_or_else(|| (vec!["--mem".into(), DEFAULT_MEM.into()], false));
                 if shutdown {
                     args.push("--exit-when-done".into());
                 }
@@ -152,12 +155,14 @@ mod linux {
                 Some(EXIT_POWER_OFF) => finish(libc::RB_POWER_OFF),
                 _ if shutdown => finish(libc::RB_POWER_OFF),
                 Some(2) => {
+                    later = None;
                     warn("memburn.cfg has a bad setting (see the message above); starting the menu in 15 s.");
                     std::thread::sleep(Duration::from_secs(15));
                 }
                 None if bin == NEXT => {
                     warn("The updated memburn crashed or could not be started; starting the booted one in 5 s.");
                     bin = MEMBURN;
+                    extra.clear();
                     std::thread::sleep(Duration::from_secs(5));
                 }
                 None => {
@@ -473,6 +478,20 @@ mod linux {
         out
     }
 
+    /// memburn.cfg arguments for a start after the first: the menu with the cfg's options, without its job.
+    pub(super) fn without_job(args: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if ["--mode", "--crash-after"].contains(&a.as_str()) {
+                it.next();
+            } else if a != "--exit-when-done" {
+                out.push(a.clone());
+            }
+        }
+        out
+    }
+
     /// "2026-10-12 11:02 UTC" -> "memburn-crash-2026-10-12-1102".
     pub(super) fn crash_file_name(stamp: &str) -> String {
         let digits: String = stamp.trim_end_matches(" UTC").replace(':', "").replace(' ', "-");
@@ -597,7 +616,7 @@ mod linux {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::linux::{crash_file_name, date, is_jc42, is_spd5118, translate, without_crash_log};
+    use super::linux::{crash_file_name, date, is_jc42, is_spd5118, translate, without_crash_log, without_job};
 
     #[test]
     fn sensor_id_checks() {
@@ -629,5 +648,19 @@ mod tests {
         assert_eq!(date(0), "1970-01-01 00:00 UTC");
         let args: Vec<String> = ["--mode", "quick", "--crash-log", "x.txt", "--tag", "t"].map(String::from).into();
         assert_eq!(without_crash_log(args), ["--mode", "quick", "--tag", "t"]);
+    }
+
+    #[test]
+    fn restarts_keep_the_cfg_options_but_not_its_job() {
+        let (args, _) = translate(
+            "mode=stress
+seconds=30
+upload=0
+update=off
+crash_after=9
+",
+            true,
+        );
+        assert_eq!(without_job(&args), ["-d", "0.5", "--no-upload", "--no-update", "--mem", "-384M"]);
     }
 }

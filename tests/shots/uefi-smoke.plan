@@ -1,0 +1,18 @@
+# Bare-metal UEFI: the headless smoke run (tests/qemu-smoke.cfg) from burn-in to power off.
+target uefi
+cfg mode=both
+cfg passes=1
+cfg seconds=15
+cfg cycles=1
+cfg mem_mib=512
+cfg fft=10,12,16
+cfg shutdown=1
+cfg debugcon=1
+wait log ^Cycle 1: 60
+sleep 2
+shot memtest
+wait log ^Burn-in: 60
+sleep 3
+shot burn
+wait log ^Result: PASS 60
+exit 30
