@@ -21,14 +21,19 @@ pub struct Dimm {
 }
 
 impl Dimm {
-    /// "DIMM_A1  16 GiB  5600 MT/s (runs at 4800)  Kingston KF556C40-16  SN 1A2B3C4D"
+    /// "P0 CHANNEL A / DIMM_A1  16 GiB  5600 MT/s (runs at 4800)  Kingston KF556C40-16  SN 1A2B3C4D"
     pub fn line(&self) -> String {
-        let mut parts = Vec::new();
-        parts.push(if self.bank.is_empty() {
-            self.locator.clone()
+        if self.bank.is_empty() {
+            self.line_as(&self.locator)
         } else {
-            format!("{} / {}", self.bank, self.locator)
-        });
+            self.line_as(&format!("{} / {}", self.bank, self.locator))
+        }
+    }
+
+    /// [`Dimm::line`] with `slot` in place of bank and locator.
+    pub fn line_as(&self, slot: &str) -> String {
+        let mut parts = Vec::new();
+        parts.push(String::from(slot));
         parts.push(size(self.size_mib));
         match (self.speed, self.configured) {
             (0, 0) => {}

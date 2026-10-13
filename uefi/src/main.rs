@@ -25,7 +25,7 @@ use memburn_core::cycler;
 use memburn_core::dram;
 use memburn_core::engine::{Chunk, Moved, PhaseJob, chunk_bytes, chunk_regions};
 use memburn_core::errlog::{self, BitList, ErrorLog, MemError};
-use memburn_core::eta::{self, Rate, Shown};
+use memburn_core::eta::{self, Rate, Section, Shown};
 use memburn_core::fft::{BurnError, BurnStats, Burner, Fault, MAX_ERR, Plan};
 use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
@@ -155,6 +155,8 @@ struct Ui {
     rate: Rate,
     test_left: Shown,
     job_left: Shown,
+    /// Progress through the cycle's memory tests.
+    section: Section,
 }
 
 impl Ui {
@@ -334,6 +336,7 @@ fn main() -> Status {
         rate: Rate::default(),
         test_left: Shown::default(),
         job_left: Shown::default(),
+        section: Section::default(),
         cores: smp.order(),
     };
     ui.screen.log(format!(
@@ -624,6 +627,7 @@ fn run_mem(sh: &Shared, ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, job: &Jo
     let chunks = chunk_regions(&claimed.regions, chunk_bytes(claimed.bytes(), smp.cpus));
     let tested: u64 = chunks.iter().map(|c| c.words as u64 * 8).sum();
     ui.tested = tested;
+    ui.section.start(ui.clock.ms_since(ui.t0));
     ui.screen.log(format!(
         "Cycle {}: memory test of {} on {} CPUs ({} in use by firmware and memburn is not tested)",
         cycle + 1,
@@ -653,6 +657,11 @@ fn run_mem(sh: &Shared, ui: &mut Ui, smp: &Smp, cfg: &Config, isa: Isa, job: &Jo
             errors_word(errors)
         ));
         ui.step(row, StepState::Done { ms: ui.clock.ms_since(t0), errors });
+    }
+    if !sh.stop.load(Ordering::Relaxed)
+        && let Current::Mem { section, done, total, .. } = &mut ui.view.current
+    {
+        (*section, *done) = (ui.section.finish(), *total);
     }
     ui.report(sh);
     claimed.release();
@@ -722,10 +731,8 @@ fn test_passes(
                     let later = rate
                         .ms(job.passes * pass_traffic)
                         .map(|ms| later_cycles * (ms + job.passes * pass_holds * hold_ms + burn_ms));
-                    let job_ms = rate
-                        .ms(all.saturating_sub(m))
-                        .zip(later)
-                        .map(|(ms, l)| ms + holds_left * hold_ms + burn_ms + l);
+                    let mem_ms = rate.ms(all.saturating_sub(m)).map(|ms| ms + holds_left * hold_ms);
+                    let job_ms = mem_ms.zip(later).map(|(ms, l)| ms + burn_ms + l);
                     let (left_ms, job_left_ms) =
                         (ui.test_left.update(now_ms, test), ui.job_left.update(now_ms, job_ms));
                     ui.sample(Some(m), None);
@@ -742,6 +749,7 @@ fn test_passes(
                         left_ms,
                         job_left_ms,
                         job_label,
+                        section: ui.section.update(now_ms, mem_ms),
                     };
                     if row.is_none() {
                         ui.view.swept(d - phase_start);
@@ -761,7 +769,9 @@ fn test_passes(
                     while clock.ms_since(h0) < hold && !sh.stop.load(Ordering::Relaxed) {
                         boot::stall(Duration::from_millis(10));
                         if ui.due() {
-                            ui.view.current = Current::Hold { left_ms: hold.saturating_sub(clock.ms_since(h0)) };
+                            let section = ui.section.update(clock.ms_since(ui.t0), None);
+                            ui.view.current =
+                                Current::Hold { left_ms: hold.saturating_sub(clock.ms_since(h0)), section };
                             ui.refresh(sh);
                         }
                     }

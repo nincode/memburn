@@ -114,6 +114,54 @@ impl Shown {
     pub fn reset(&mut self) {
         self.at = None;
     }
+
+    /// The last estimate counted down to `now_ms`.
+    pub fn counted(&self, now_ms: u64) -> Option<u64> {
+        self.at.map(|(t, left)| left.saturating_sub(now_ms.saturating_sub(t)))
+    }
+}
+
+/// [`Section`]'s figure moves at most this many times the pace the current estimate gives.
+const SECTION_CATCH_UP: u64 = 3;
+
+/// Progress through a section of the job: time spent over time spent plus time left, never going back.
+#[derive(Default, Clone)]
+pub struct Section {
+    start_ms: u64,
+    last_ms: u64,
+    left: Shown,
+    /// Parts per million.
+    ppm: u64,
+}
+
+impl Section {
+    pub fn start(&mut self, now_ms: u64) {
+        *self = Section { start_ms: now_ms, last_ms: now_ms, ..Section::default() };
+    }
+
+    /// Takes the section's time left, or None to count the last one down; returns ‰, under 1000 until [`Section::finish`].
+    pub fn update(&mut self, now_ms: u64, left_ms: Option<u64>) -> u16 {
+        let left = if left_ms.is_some() { self.left.update(now_ms, left_ms) } else { self.left.counted(now_ms) };
+        let dt = now_ms.saturating_sub(self.last_ms);
+        self.last_ms = now_ms;
+        if let Some(left) = left {
+            let spent = now_ms.saturating_sub(self.start_ms);
+            let target = (spent * 1_000_000).checked_div(spent + left).unwrap_or(0).min(999_000);
+            let step = (dt * 1_000_000 * SECTION_CATCH_UP).checked_div(spent + left).unwrap_or(0);
+            self.ppm = self.ppm.max(target.min(self.ppm + step));
+        }
+        self.permille()
+    }
+
+    pub fn finish(&mut self) -> u16 {
+        self.ppm = 1_000_000;
+        self.permille()
+    }
+
+    /// ‰.
+    pub fn permille(&self) -> u16 {
+        (self.ppm / 1000) as u16
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +238,44 @@ mod tests {
         assert_eq!(s.update(1_000, Some(101_000)), Some(99_000));
         assert_eq!(s.update(2_000, Some(110_000)), Some(110_000));
         assert_eq!(s.update(3_000, Some(1_000)), Some(1_000));
+    }
+
+    /// 2 passes × 4 tests × 3 steps at a rate that halves and recovers: the figure only rises and ends at 1000.
+    #[test]
+    fn section_rises_to_the_end_of_the_last_step() {
+        let tests = [(TestId::AddressOwn, 1), (TestId::MovingInvOnes, 1), (TestId::Modulo20, 1), (TestId::Hashed, 1)];
+        let bytes = 8 * GIB;
+        let (passes, steps) = (2u64, 3u64);
+        let all = passes * pass_traffic(&tests, bytes);
+        let (mut rate, mut sec) = (Rate::default(), Section::default());
+        let (mut now, mut moved, mut last) = (0u64, 0u64, 0u16);
+        sec.start(now);
+        let mut seen = Vec::new();
+        for p in 0..passes {
+            for (ti, &(t, r)) in tests.iter().enumerate() {
+                let step_traffic = test_traffic(t, r, bytes) / steps;
+                for s in 0..steps {
+                    let per_ms = if (p as usize * 4 + ti) % 3 == 1 { 500_000 } else { 1_000_000 };
+                    let end = moved + step_traffic;
+                    while moved < end {
+                        now += 250;
+                        moved = (moved + per_ms * 250).min(end);
+                        rate.sample(now, moved);
+                        let pm = sec.update(now, rate.ms(all - moved));
+                        assert!(pm >= last && pm < 1000, "pass {p} test {ti} step {s}: {pm} after {last}");
+                        last = pm;
+                    }
+                    seen.push(last);
+                }
+            }
+        }
+        assert!(seen[0] < 100 && seen[seen.len() / 2] > 350 && last > 950, "{seen:?}");
+        assert_eq!(sec.finish(), 1000);
+        let mut hold = Section::default();
+        hold.start(0);
+        assert_eq!(hold.update(1_000, None), 0);
+        let at = hold.update(1_000, Some(9_000));
+        assert!(hold.update(9_000, None) > at);
     }
 
     #[test]

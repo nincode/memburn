@@ -2,6 +2,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use memburn_core::memtest::TestId;
@@ -276,17 +277,6 @@ fn pill(v: &View) -> (String, u32, u32) {
     }
 }
 
-/// Percent done of the current step, for the big figure and the bar.
-fn percent(c: &Current) -> Option<u64> {
-    match *c {
-        Current::Mem { done, total, .. } => Some((done * 100).checked_div(total).unwrap_or(0).min(100)),
-        Current::Burn { elapsed_ms, total_ms, .. } | Current::Core { elapsed_ms, total_ms, .. } => {
-            Some((elapsed_ms * 100).checked_div(total_ms).unwrap_or(0).min(100))
-        }
-        _ => None,
-    }
-}
-
 /// Title and two lines under it for the current step.
 fn lines(v: &View) -> (String, String, String) {
     let e = String::new;
@@ -311,6 +301,7 @@ fn lines(v: &View) -> (String, String, String) {
             left_ms,
             job_left_ms,
             job_label,
+            ..
         } => {
             let pass = if *passes > 1 { format!("  ·  pass {pass} of {passes}") } else { e() };
             let pos = format!("{}{pass}  ·  test {index} of {count}  ·  step {step} of {steps}", v.job);
@@ -322,7 +313,7 @@ fn lines(v: &View) -> (String, String, String) {
                 format!("{amount}  ·  {}", tui::time_left(*left_ms, *job_left_ms, job_label)),
             )
         }
-        Current::Hold { left_ms } => {
+        Current::Hold { left_ms, .. } => {
             (String::from(TestId::BitFade.name()), String::from("memory idle"), format!("{} left", clock(*left_ms)))
         }
         Current::Burn { isa, threads, sizes, ffts, elapsed_ms, total_ms, worst } => (
@@ -344,6 +335,9 @@ fn lines(v: &View) -> (String, String, String) {
     }
 }
 
+/// Caption of the bar while it shows the memory tests.
+const MEM_SECTION: &str = "all memory tests";
+
 fn hero(v: &View, d: &mut D) {
     let split = L + (d.w - 2.0 * L) * 0.47;
     let (text, fill, ink) = pill(v);
@@ -351,7 +345,7 @@ fn hero(v: &View, d: &mut D) {
     let pw = pw.min(split - L);
     d.rrect(L, 76.0, pw, 26.0, 13.0, fill);
     d.text(SansBold, 13.0, L + 12.0, 94.0, &text, ink, pw - 24.0);
-    let pct = percent(&v.current);
+    let pct = v.current.percent();
     let big: Option<(String, &str, u32)> = match v.verdict {
         Verdict::Pass => Some((String::from("PASS"), "", GREEN)),
         Verdict::Fail => Some((String::from("FAIL"), "", RED)),
@@ -384,7 +378,12 @@ fn hero(v: &View, d: &mut D) {
         d.text(Sans, 15.0, tx, 160.0 + 22.0 * k as f32, line, *c, room);
     }
     if let Some(p) = pct.filter(|_| !matches!(v.current, Current::Summary(_))) {
-        let bw = split - L;
+        let mut bw = split - L;
+        if matches!(v.current, Current::Mem { .. } | Current::Hold { .. }) {
+            let cw = d.measure(Sans, 13.0, MEM_SECTION);
+            d.text_r(Sans, 13.0, split, 205.0, MEM_SECTION, MID);
+            bw -= cw + 14.0;
+        }
         d.rrect(L, 198.0, bw, 4.0, 2.0, HAIR);
         let fill = (bw * p as f32 / 100.0).max(4.0);
         d.rrect(L, 198.0, fill, 4.0, 2.0, INK);
@@ -497,15 +496,42 @@ fn summary_card(v: &View, d: &mut D, (x, y, w, h): (f32, f32, f32, f32)) {
     let Current::Summary(rows) = &v.current else { return };
     let pitch = 22.0;
     let per = (((h - 70.0) / pitch) as usize + 1).max(1);
-    let cols = rows.len().div_ceil(per).max(1);
-    let cw = (w - 36.0) / cols as f32;
-    let lw = rows.iter().map(|(l, _)| d.measure(Sans, 13.0, l)).fold(0.0, f32::max) + 16.0;
-    for (k, (label, value)) in rows.iter().enumerate() {
-        let (cx, cy) = (x + 18.0 + (k / per) as f32 * cw, y + 56.0 + (k % per) as f32 * pitch);
-        d.text(Sans, 13.0, cx, cy, label, MID, lw);
-        let c = if value.starts_with("likely") { RED } else { INK };
-        d.text(Sans, 14.0, cx + lw, cy, value, c, cw - lw - 16.0);
+    let at = summary_places(rows, per);
+    let cols = at.iter().map(|&(c, _)| c + 1).max().unwrap_or(1);
+    let sizes: Vec<(f32, f32)> =
+        rows.iter().map(|(l, v)| (d.measure(Sans, 13.0, l), d.measure(Sans, 14.0, v))).collect();
+    let widest = |c: usize, f: fn(&(f32, f32)) -> f32| {
+        sizes.iter().zip(&at).filter(|(_, p)| p.0 == c).map(|(s, _)| f(s)).fold(0.0, f32::max)
+    };
+    let lw: Vec<f32> = (0..cols).map(|c| widest(c, |s| s.0) + 16.0).collect();
+    let mut xs = vec![x + 18.0];
+    for c in 0..cols - 1 {
+        let natural = lw[c] + widest(c, |s| s.1) + 40.0;
+        xs.push(xs[c] + natural.min((w - 36.0) / cols as f32));
     }
+    for ((label, value), &(col, row)) in rows.iter().zip(&at) {
+        let (cx, cy) = (xs[col], y + 56.0 + row as f32 * pitch);
+        let end = if at.contains(&(col + 1, row)) { xs[col + 1] - 16.0 } else { x + w - 18.0 };
+        d.text(Sans, 13.0, cx, cy, label, MID, lw[col]);
+        let c = if value.starts_with("likely") { RED } else { INK };
+        d.text(Sans, 14.0, cx + lw[col], cy, value, c, end - cx - lw[col]);
+    }
+}
+
+/// (column, row) of each summary row, `per` rows a column; a labelled row and the unlabelled rows after it stay in one column when they fit in one.
+pub(crate) fn summary_places(rows: &[(String, String)], per: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(rows.len());
+    let (mut col, mut row) = (0, 0);
+    for (k, (label, _)) in rows.iter().enumerate() {
+        let group = 1 + rows[k + 1..].iter().take_while(|(l, _)| l.is_empty()).count();
+        let starts = !label.is_empty() || k == 0;
+        if row == per || (starts && row > 0 && row + group > per && group <= per) {
+            (col, row) = (col + 1, 0);
+        }
+        out.push((col, row));
+        row += 1;
+    }
+    out
 }
 
 /// "0xabd160000–abd16ffff".

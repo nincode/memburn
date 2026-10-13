@@ -19,7 +19,7 @@ use memburn_core::cycler;
 use memburn_core::dram;
 use memburn_core::engine::{Moved, PhaseJob, chunk_bytes, chunk_regions};
 use memburn_core::errlog::{self, BitList, ErrorLog};
-use memburn_core::eta::{self, Rate, Shown};
+use memburn_core::eta::{self, Rate, Section, Shown};
 use memburn_core::fft::{BurnError, BurnStats, Burner, Fault, MAX_ERR, MAX_LOG2N, MIN_LOG2N, Plan, Work};
 use memburn_core::history::{self, History};
 use memburn_core::memtest::{self, TestId};
@@ -196,6 +196,8 @@ struct Ctx<'a> {
     rate: Rate,
     test_left: Shown,
     job_left: Shown,
+    /// Progress through the cycle's memory tests.
+    section: Section,
 }
 
 fn main() -> ExitCode {
@@ -452,6 +454,7 @@ fn run(args: &Args) -> Result<u8, String> {
         rate: Rate::default(),
         test_left: Shown::default(),
         job_left: Shown::default(),
+        section: Section::default(),
     };
     let mut job = match args.mode {
         _ if args.job.is_some() => {
@@ -981,6 +984,7 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
     let mut held = 0u64;
     let moved = Moved::default();
     let start = Instant::now();
+    c.section.start(c.out.elapsed().as_millis() as u64);
     let deadline = stress.map(|d| start + d);
     let over = |stop: &AtomicBool| stop.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d);
     let side_done = AtomicBool::new(false);
@@ -1057,10 +1061,10 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                             let in_pass = d - (p * per_pass).min(d);
                             let now_ms = c.out.elapsed().as_millis() as u64;
                             c.rate.sample(now_ms, m);
-                            let (test_ms, job_ms) = match (deadline, stress) {
+                            let (test_ms, job_ms, mem_ms) = match (deadline, stress) {
                                 (Some(dl), Some(per)) => {
                                     let left = dl.saturating_duration_since(shown).as_millis() as u64;
-                                    (Some(left), Some(left + later_cycles * per.as_millis() as u64))
+                                    (Some(left), Some(left + later_cycles * per.as_millis() as u64), Some(left))
                                 }
                                 _ => {
                                     let r = &c.rate;
@@ -1072,9 +1076,9 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                                     let later = r
                                         .ms(all)
                                         .map(|ms| later_cycles * (ms + job.passes * pass_holds * hold_ms + burn_ms));
-                                    let job_ms =
-                                        cycle_ms.zip(later).map(|(ms, l)| ms + holds_left * hold_ms + burn_ms + l);
-                                    (c.test_left.update(now_ms, test), c.job_left.update(now_ms, job_ms))
+                                    let mem_ms = cycle_ms.map(|ms| ms + holds_left * hold_ms);
+                                    let job_ms = mem_ms.zip(later).map(|(ms, l)| ms + burn_ms + l);
+                                    (c.test_left.update(now_ms, test), c.job_left.update(now_ms, job_ms), mem_ms)
                                 }
                             };
                             c.out.view.current = Current::Mem {
@@ -1090,6 +1094,7 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                                 left_ms: test_ms,
                                 job_left_ms: job_ms,
                                 job_label: if job.cycles == 0 { "cycle" } else { "job" },
+                                section: c.section.update(now_ms, mem_ms),
                             };
                             c.out.view.swept(d - phase_start);
                             let burn_part =
@@ -1120,7 +1125,8 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
                         let until = Instant::now() + Duration::from_secs(a.fade_secs);
                         while Instant::now() < until && !over(c.stop) {
                             let left = until.saturating_duration_since(Instant::now());
-                            c.out.view.current = Current::Hold { left_ms: left.as_millis() as u64 };
+                            let section = c.section.update(c.out.elapsed().as_millis() as u64, None);
+                            c.out.view.current = Current::Hold { left_ms: left.as_millis() as u64, section };
                             c.out.status(
                                 false,
                                 &format!("[mem] {}: letting memory sit idle, {} left", t.name(), fmt_dur(left)),
@@ -1155,6 +1161,11 @@ fn run_mem(c: &mut Ctx, job: &Job, cycle: u64) -> Result<(), String> {
         }
         side_done.store(true, Ordering::Relaxed);
     });
+    if !c.stop.load(Ordering::Relaxed)
+        && let Current::Mem { section, done, total, .. } = &mut c.out.view.current
+    {
+        (*section, *done) = (c.section.finish(), *total);
+    }
     c.out.view.fft = None;
     if stress.is_some() {
         let errors = c.log.count() + c.burn.errors.count();

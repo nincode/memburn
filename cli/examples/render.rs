@@ -88,6 +88,7 @@ fn mem_test(test: TestId, index: u32, step: u32, steps: u32, pct: u64) -> Curren
         left_ms: Some(31_000),
         job_left_ms: Some(152_000),
         job_label: "job",
+        section: ((index as u64 - 1) * 333 + pct * 333 / 100) as u16,
     }
 }
 

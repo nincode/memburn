@@ -84,3 +84,37 @@ fn frame_time() {
     }
     println!("sampling 32 lanes: {:.2} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
 }
+
+#[test]
+fn summary_keeps_the_modules_together() {
+    let rows = |n: usize, m: usize| -> Vec<(String, String)> {
+        let other = (0..n).map(|k| (format!("Row {k}"), String::from("x")));
+        let lead = |k: usize| if k == 0 { String::from("Modules") } else { String::new() };
+        other.chain((0..m).map(|k| (lead(k), String::from("m")))).collect()
+    };
+    let cols = |n, m| crate::dash::summary_places(&rows(n, m), 8);
+    assert_eq!(cols(6, 2).iter().map(|p| p.0).collect::<Vec<_>>(), [0; 8]);
+    assert_eq!(cols(7, 2)[7..], [(1, 0), (1, 1)]);
+    assert_eq!(cols(7, 4)[7..], [(1, 0), (1, 1), (1, 2), (1, 3)]);
+    assert_eq!(cols(2, 10)[2..].iter().map(|p| p.0).collect::<Vec<_>>(), [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]);
+}
+
+#[test]
+fn section_figure_follows_the_running_section() {
+    for (name, want) in [("quick-memory-mid", 61), ("memory-hold", 70), ("quick-burn-in", 40)] {
+        let v = states().into_iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(v.current.percent(), Some(want), "{name}");
+    }
+    let mut v = burn(false);
+    v.current = memburn_core::tui::Current::Core {
+        label: "CPU 3".into(),
+        index: 3,
+        count: 8,
+        cycle: 1,
+        isa: None,
+        ffts: 0,
+        elapsed_ms: 60_000,
+        total_ms: 120_000,
+    };
+    assert_eq!(v.current.percent(), Some(31));
+}

@@ -274,6 +274,7 @@ pub fn view(t: f64, failing: bool) -> View {
             left_ms: Some(left),
             job_left_ms: Some(left + 61_000),
             job_label: "job",
+            section: (elapsed * 1000 / (elapsed + left + 61_000)) as u16,
         },
         remote: Some(Remote { url: url.into(), status: "uploading  ·  0 s ago".into(), ok: true, qr: Some(qr(url)) }),
         keys: vec![("Esc", "stop"), ("Q", "bigger QR")],

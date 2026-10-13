@@ -340,7 +340,7 @@ fn current(c: &TuiCurrent) -> Current {
         TuiCurrent::Summary(rows) => Current {
             kind: Phase::Summary,
             title: "Summary".into(),
-            lines: rows.iter().map(|(l, v)| format!("{l}: {v}")).collect(),
+            lines: rows.iter().map(|(l, v)| if l.is_empty() { v.clone() } else { format!("{l}: {v}") }).collect(),
             progress: None,
         },
         TuiCurrent::Mem {
@@ -356,6 +356,7 @@ fn current(c: &TuiCurrent) -> Current {
             left_ms,
             job_left_ms,
             job_label,
+            ..
         } => Current {
             kind: Phase::Mem,
             title: test.name().into(),
@@ -364,13 +365,13 @@ fn current(c: &TuiCurrent) -> Current {
                 format!("{:.1} / {:.1} GiB", *done as f64 / (1u64 << 30) as f64, *total as f64 / (1u64 << 30) as f64),
                 tui::time_left(*left_ms, *job_left_ms, job_label).replace("  ·  ", " · "),
             ],
-            progress: Some((done * 100).checked_div(*total).unwrap_or(0) as u8),
+            progress: c.percent().map(|p| p as u8),
         },
-        TuiCurrent::Hold { left_ms } => Current {
+        TuiCurrent::Hold { left_ms, .. } => Current {
             kind: Phase::Hold,
             title: "Bit fade".into(),
             lines: vec!["memory idle".into(), format!("{} left", tui::clock(*left_ms))],
-            progress: None,
+            progress: c.percent().map(|p| p as u8),
         },
         TuiCurrent::Burn { isa, threads, sizes, ffts, elapsed_ms, total_ms, worst } => Current {
             kind: Phase::Burn,
@@ -381,7 +382,7 @@ fn current(c: &TuiCurrent) -> Current {
                 format!("{} FFTs checked", tui::group(*ffts)),
                 format!("worst rounding {:.4} · limit 0.4", f64::from_bits(*worst)),
             ],
-            progress: Some((elapsed_ms * 100).checked_div(*total_ms).unwrap_or(0).min(100) as u8),
+            progress: c.percent().map(|p| p as u8),
         },
         TuiCurrent::Core { label, index, count, cycle, isa, ffts, elapsed_ms, total_ms } => {
             let (head, what) = tui::core_lines(label, *index, *count, *cycle, *isa);
@@ -394,7 +395,7 @@ fn current(c: &TuiCurrent) -> Current {
                     format!("{} / {}", tui::clock(*elapsed_ms), tui::clock(*total_ms)),
                     format!("{} FFTs checked", tui::group(*ffts)),
                 ],
-                progress: Some((elapsed_ms * 100).checked_div(*total_ms).unwrap_or(0).min(100) as u8),
+                progress: c.percent().map(|p| p as u8),
             }
         }
     }

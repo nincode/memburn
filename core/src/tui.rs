@@ -185,9 +185,15 @@ pub enum Current {
         /// The job's time left, or the cycle's when `job_label` is "cycle"; None while estimating.
         job_left_ms: Option<u64>,
         job_label: &'static str,
+        /// Progress through all memory tests of the cycle, ‰.
+        section: u16,
     },
     /// Bit-fade wait: memory is left idle.
-    Hold { left_ms: u64 },
+    Hold {
+        left_ms: u64,
+        /// As in [`Current::Mem`].
+        section: u16,
+    },
     Burn {
         isa: &'static str,
         threads: u32,
@@ -212,6 +218,30 @@ pub enum Current {
         elapsed_ms: u64,
         total_ms: u64,
     },
+}
+
+impl Current {
+    /// Progress of the job's running section, ‰: the memory tests, the burn-in, or the core cycler's cycle.
+    pub fn progress(&self) -> Option<u16> {
+        match *self {
+            Current::Mem { section, .. } | Current::Hold { section, .. } => Some(section.min(1000)),
+            Current::Burn { elapsed_ms, total_ms, .. } => Some(permille(elapsed_ms.min(total_ms), total_ms)),
+            Current::Core { index, count, elapsed_ms, total_ms, .. } => {
+                let done = index.saturating_sub(1) as u64 * total_ms + elapsed_ms.min(total_ms);
+                Some(permille(done, count as u64 * total_ms))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Current::progress`] in whole percent.
+    pub fn percent(&self) -> Option<u64> {
+        self.progress().map(|p| p as u64 / 10)
+    }
+}
+
+fn permille(done: u64, total: u64) -> u16 {
+    (done * 1000).checked_div(total).unwrap_or(0).min(1000) as u16
 }
 
 #[derive(Default)]
@@ -695,8 +725,10 @@ fn current(v: &View, f: &mut Frame, r: Rect) {
     let title = match v.current {
         Current::Menu(_) => "Start",
         Current::Summary(_) => "Summary",
+        Current::Mem { .. } | Current::Hold { .. } => "Memory tests",
         _ => "Current test",
     };
+    let pct = v.current.percent().unwrap_or(0) as usize;
     let i = f.panel(r, title, None);
     let line = |n: usize| i.y + n;
     match &v.current {
@@ -714,7 +746,12 @@ fn current(v: &View, f: &mut Frame, r: Rect) {
             }
         }
         Current::Summary(rows) => {
-            for (n, (label, value)) in rows.iter().take(i.h).enumerate() {
+            let modules = rows.iter().position(|(l, _)| l.starts_with("Module")).unwrap_or(rows.len());
+            let end = if rows.len() > i.h { modules } else { rows.len() };
+            let rows = rows[..end]
+                .iter()
+                .chain(rows[end..].iter().skip_while(|(l, _)| l.is_empty() || l.starts_with("Module")));
+            for (n, (label, value)) in rows.take(i.h).enumerate() {
                 f.text(i.x, line(n), label, 16, LightGray, Black);
                 f.text(i.x + 16, line(n), value, i.w.saturating_sub(16), White, Black);
             }
@@ -732,25 +769,25 @@ fn current(v: &View, f: &mut Frame, r: Rect) {
             left_ms,
             job_left_ms,
             job_label,
+            ..
         } => {
             f.text(i.x, line(0), test.name(), i.w, White, Black);
             let pos = format!("pass {pass}/{passes}  ·  test {index}/{count}  ·  step {step}/{steps}");
             f.text(i.x, line(1), &pos, i.w, LightGray, Black);
-            let pct = (done * 100).checked_div(*total).unwrap_or(0);
-            bar(f, i.x, line(2), i.w, pct as usize, LightCyan);
+            bar(f, i.x, line(2), i.w, pct, LightCyan);
             f.text(i.x, line(3), &format!("{} / {}", gib(*done), gib(*total)), i.w, LightGray, Black);
             f.text(i.x, line(4), &time_left(*left_ms, *job_left_ms, job_label), i.w, LightGray, Black);
         }
-        Current::Hold { left_ms } => {
+        Current::Hold { left_ms, .. } => {
             f.text(i.x, line(0), TestId::BitFade.name(), i.w, White, Black);
             f.text(i.x, line(1), "memory idle", i.w, LightGray, Black);
-            f.text(i.x, line(2), &format!("{} left", clock(*left_ms)), i.w, LightGray, Black);
+            bar(f, i.x, line(2), i.w, pct, LightCyan);
+            f.text(i.x, line(3), &format!("{} left", clock(*left_ms)), i.w, LightGray, Black);
         }
         Current::Burn { isa, threads, sizes, ffts, elapsed_ms, total_ms, worst } => {
             f.text(i.x, line(0), "FFT burn-in", i.w, White, Black);
             f.text(i.x, line(1), &format!("{isa}  ·  {threads} threads  ·  2^{sizes}"), i.w, LightGray, Black);
-            let pct = (elapsed_ms * 100).checked_div(*total_ms).unwrap_or(0).min(100);
-            bar(f, i.x, line(2), i.w, pct as usize, Yellow);
+            bar(f, i.x, line(2), i.w, pct, Yellow);
             let t = format!("{} / {}", clock(*elapsed_ms), clock(*total_ms));
             f.text(i.x, line(3), &t, i.w, LightGray, Black);
             f.text(i.x, line(4), &format!("{} FFTs checked", group(*ffts)), i.w, LightGray, Black);
@@ -764,8 +801,7 @@ fn current(v: &View, f: &mut Frame, r: Rect) {
             f.text(i.x, line(0), "Core cycler", i.w, White, Black);
             f.text(i.x, line(1), &head, i.w, LightGray, Black);
             f.text(i.x, line(2), &what, i.w, if isa.is_some() { LightGray } else { DarkGray }, Black);
-            let pct = (elapsed_ms * 100).checked_div(*total_ms).unwrap_or(0).min(100);
-            bar(f, i.x, line(3), i.w, pct as usize, Yellow);
+            bar(f, i.x, line(3), i.w, pct, Yellow);
             f.text(i.x, line(4), &format!("{} / {}", clock(*elapsed_ms), clock(*total_ms)), i.w, LightGray, Black);
             if i.h > 5 {
                 f.text(i.x, line(5), &format!("{} FFTs checked", group(*ffts)), i.w, LightGray, Black);
@@ -1019,16 +1055,17 @@ fn modules_height(n: usize, h: usize) -> usize {
     if rows == 0 { 0 } else { rows + 2 }
 }
 
-/// Short slot name: the locator when it tells the modules apart, else the bank, else both.
+/// Short slot name: the locator when it tells the modules apart, else the bank, else both; "Ctrl0-ChA-DIMM0".
 pub fn slot(d: &Dimm, all: &[Dimm]) -> String {
     let unique = |f: fn(&Dimm) -> &str| !f(d).is_empty() && all.iter().filter(|o| f(o) == f(d)).count() == 1;
-    if unique(|d| &d.locator) {
+    let name = if unique(|d| &d.locator) {
         d.locator.clone()
     } else if unique(|d| &d.bank) {
         d.bank.clone()
     } else {
         format!("{} {}", d.bank, d.locator).trim().into()
-    }
+    };
+    name.replace("Controller", "Ctrl").replace("Channel", "Ch")
 }
 
 /// One line per module: slot, size, speed, part; the last row counts the ones that do not fit.
@@ -1161,10 +1198,16 @@ pub fn cpu_line(e: &BurnError) -> String {
     format!("cpu {:<3}  FFT 2^{:<2}  {what}", e.worker, e.log2n)
 }
 
-/// Summary rows: how to find the faulty stick when bits in `flipped` failed, then one per memory module.
+/// Summary rows: how to find the faulty stick when bits in `flipped` failed, then the modules, labelled on the first row only.
 pub fn module_rows(dimms: &[Dimm], suspects: &[Suspect], flipped: u64) -> Vec<(String, String)> {
     let find = (flipped != 0).then(|| (String::from("Find the stick"), find_stick(suspects, flipped)));
-    find.into_iter().chain(dimms.iter().map(|d| (String::from("Module"), d.line()))).collect()
+    let label = |k: usize| match (k, dimms.len()) {
+        (0, 1) => String::from("Module"),
+        (0, _) => String::from("Modules"),
+        _ => String::new(),
+    };
+    let modules = dimms.iter().enumerate().map(|(k, d)| (label(k), d.line_as(&slot(d, dimms))));
+    find.into_iter().chain(modules).collect()
 }
 
 /// "likely DIMM_B2" from the DRAM map, most errors first; else the swap advice of [`locate`].
@@ -1267,6 +1310,7 @@ mod tests {
                 left_ms: Some(9000),
                 job_left_ms: Some(130_000),
                 job_label: "job",
+                section: 320,
             },
             perf: Perf { mem: vec![20_000, 22_000, 25_000], temp_c: Some(64), ..Perf::default() },
             mem_errors: 4,

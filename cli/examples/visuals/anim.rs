@@ -77,7 +77,8 @@ fn memtest(ms: u64) -> View {
             }
         }
     }
-    if let Current::Mem { done, step, left_ms, job_left_ms, total: t, .. } = &mut v.current {
+    if let Current::Mem { done, step, left_ms, job_left_ms, total: t, section, .. } = &mut v.current {
+        *section += (ms / 1000) as u16;
         *step += (ms / SWEEP_MS) as u32;
         *done = (*done + *t * ms / 200_000).min(*t);
         *left_ms = left_ms.map(|l| l - ms);

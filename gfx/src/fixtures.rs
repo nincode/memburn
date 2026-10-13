@@ -73,6 +73,86 @@ pub fn dimms() -> Vec<Dimm> {
         .to_vec()
 }
 
+/// i9-13900HX laptop: `n` SK Hynix DDR5 SODIMMs behind Intel's long locators.
+pub fn laptop_dimms(n: usize) -> Vec<Dimm> {
+    (0..n)
+        .map(|k| Dimm {
+            locator: format!("Controller{}-Channel{}-DIMM0", k / 2, ["A", "B"][k % 2]),
+            bank: format!("BANK {k}"),
+            size_mib: 16384,
+            speed: 5600,
+            configured: 5600,
+            manufacturer: "SK Hynix".into(),
+            part: "HMCG78AGBSA095N".into(),
+            serial: format!("8A1B2C{k:02X}"),
+        })
+        .collect()
+}
+
+/// Quick check on the laptop of [`laptop_dimms`]: `running` is the plan row running, the rows before it passed.
+pub fn laptop(n: usize, running: Option<usize>) -> View {
+    let mut v = base(false);
+    v.system =
+        ["Intel Core i9-13900HX", "32 threads", "AVX2+FMA", "31.7 GiB", "Secure Boot on"].map(String::from).to_vec();
+    v.dimms = laptop_dimms(n);
+    v.dram = None;
+    v.job = "Quick check".into();
+    v.plan = ["Own address", "Moving inversions, 8-bit walk", "Random sequence ×5", "Hashed pattern", "FFT burn-in"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Step {
+            name: (*name).into(),
+            note: if i == 4 { "0:02:00" } else { "" }.into(),
+            state: match running {
+                Some(r) if i == r => StepState::Running,
+                Some(r) if i > r => StepState::Pending,
+                _ => StepState::Done { ms: [4_100, 38_200, 61_900, 21_400, 120_000][i], errors: 0 },
+            },
+        })
+        .collect();
+    let total = 296 * GIB / 10;
+    v.current = Current::Mem {
+        test: TestId::RandomSeq,
+        pass: 1,
+        passes: 1,
+        index: 3,
+        count: 4,
+        step: 7,
+        steps: 10,
+        done: total * 31 / 100,
+        total,
+        left_ms: Some(18_000),
+        job_left_ms: Some(156_000),
+        job_label: "job",
+        section: 612,
+    };
+    v.elapsed_ms = 57_000;
+    v
+}
+
+/// The laptop's result: the rows memburn shows on Linux, then the modules.
+pub fn laptop_result(n: usize) -> View {
+    let mut v = laptop(n, None);
+    v.verdict = Verdict::Pass;
+    let mut rows: Vec<(String, String)> = [
+        ("Memory tested", "29.6 GiB, 4 tests"),
+        ("Burn-in", "2:00, 1 284 556 FFTs, no errors"),
+        ("Coverage", "29.6 of 31.7 GiB System RAM (over 3 runs 30.1)"),
+        ("Earlier runs", "2, no errors"),
+        ("Peak CPU temp", "94 °C"),
+        ("Peak RAM temp", "51 °C"),
+        ("Total time", "0:04:06"),
+    ]
+    .map(|(l, v)| (l.into(), v.into()))
+    .to_vec();
+    rows.extend(tui::module_rows(&v.dimms, &[], 0));
+    v.current = Current::Summary(rows);
+    v.advice = "29.6 GiB memory and 1 284 556 FFTs checked in 0:04:06".into();
+    v.elapsed_ms = 246_000;
+    v.keys = vec![("F", "full memory"), ("B", "burn-in"), ("A", "all"), ("R", "restart"), ("P", "power off")];
+    v
+}
+
 /// (bit, 0->1, phys, test) as a failing run found them.
 pub fn error_seq() -> Vec<(u32, bool, u64, TestId)> {
     use TestId::*;
@@ -164,6 +244,7 @@ pub fn base(failing: bool) -> View {
             left_ms: Some(83_000),
             job_left_ms: Some(144_000),
             job_label: "job",
+            section: 667,
         },
         remote: Some(Remote { url: url.into(), status: "uploading  ·  0 s ago".into(), ok: true, qr: Some(qr(url)) }),
         keys: vec![("Esc", "stop"), ("Q", "bigger QR")],
@@ -468,6 +549,26 @@ pub fn extra() -> Vec<(&'static str, View)> {
     v.remote = None;
     v.update = Some(line("update check", "offline", None, UpdateTone::Error));
     out.push(("update-offline", v));
+    out.push(("quick-memory-mid", laptop(2, Some(2))));
+    let mut v = base(false);
+    v.current = Current::Hold { left_ms: 41_000, section: 702 };
+    out.push(("memory-hold", v));
+    let mut v = laptop(2, Some(4));
+    v.current = Current::Burn {
+        isa: "AVX2+FMA",
+        threads: 32,
+        sizes: "{10..21}".into(),
+        ffts: 512_300,
+        elapsed_ms: 48_000,
+        total_ms: 120_000,
+        worst: 0.21f64.to_bits(),
+    };
+    v.map = None;
+    v.perf.gflops = gflops_series(THREADS, 200);
+    v.fft = Some(fft(THREADS, LANE_GFLOPS, None, 150));
+    out.push(("quick-burn-in", v));
+    out.push(("result-2-modules", laptop_result(2)));
+    out.push(("result-4-modules", laptop_result(4)));
     out
 }
 
@@ -491,9 +592,9 @@ pub fn render(v: &View, w: usize, h: usize) -> Canvas {
 
 /// [`fnv`] of each of [`scenes`] at 1280×800.
 pub const SNAPSHOTS: [(&str, u64); 5] = [
-    ("running-clean", 0xe9132a0aa48d5705),
-    ("running-fail", 0x8c80078706813487),
+    ("running-clean", 0xb3c7a2947a35fa64),
+    ("running-fail", 0xaeac9069cc1c3452),
     ("menu", 0x63505246340c6297),
-    ("result-pass", 0xaad68a7df3469492),
-    ("result-fail", 0x5f34db03814885f8),
+    ("result-pass", 0x5209d34ce6edff6e),
+    ("result-fail", 0xbeb0423afa32abec),
 ];
