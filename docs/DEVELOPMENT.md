@@ -16,7 +16,8 @@ Every front end draws the same full-screen dashboard; networked runs upload to a
 
 ```sh
 cargo build --release                                     # Linux
-cargo build --release --target x86_64-pc-windows-gnu      # Windows exe
+cargo build --release --target x86_64-pc-windows-gnu      # Windows exe; x86_64-w64-mingw32-windres embeds cli/memburn.ico
+scripts/icons.sh                                          # docs/img/icon.svg → favicons and cli/memburn.ico (google-chrome, python3)
 scripts/mkusb.sh                                          # Docker build → target/usb/memburn-<version>-usb.img
 cargo test --workspace --exclude memburn-uefi             # core, proto, cli; fault injection included
 scripts/run-qemu.sh                                       # bare-metal UEFI build in QEMU/OVMF
@@ -91,7 +92,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-9-3` for 0.9.3 |
+| Volume label | `MB 0-9-4` for 0.9.4 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |

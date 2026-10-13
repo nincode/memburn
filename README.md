@@ -1,4 +1,4 @@
-# memburn
+# <img src="docs/img/icon.svg" alt="" width="40" height="40" align="top"> memburn
 
 Memory test and CPU burn-in on a bootable USB stick. Free and open source, MIT licence.
 

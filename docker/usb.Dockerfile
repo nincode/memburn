@@ -4,13 +4,13 @@ FROM rust:1.99-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913
 # Release key for the stick's self-update, hex; empty keeps the one in proto/src/release.rs.
 ARG MEMBURN_RELEASE_KEY=
 RUN rustup target add x86_64-unknown-linux-musl x86_64-unknown-uefi x86_64-pc-windows-gnu \
- && apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 musl-tools \
+ && apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 musl-tools \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 # The target cache is shared across trees whose mtimes come from git; fresh mtimes force workspace crates to rebuild.
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
-    find . -path ./target -prune -o -type f \( -name '*.rs' -o -name Cargo.toml -o -name '*.html' -o -name '*.png' -o -name '*.svg' \) -exec touch {} + \
+    find . -path ./target -prune -o -type f \( -name '*.rs' -o -name Cargo.toml -o -name '*.html' -o -name '*.png' -o -name '*.svg' -o -name '*.ico' \) -exec touch {} + \
  && cargo build --release --locked --target x86_64-unknown-linux-musl -p memburn -p memburn-init \
  && cargo build --release --locked --target x86_64-unknown-uefi -p memburn-uefi \
  && cargo build --release --locked --target x86_64-pc-windows-gnu -p memburn \
