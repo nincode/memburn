@@ -200,6 +200,27 @@ struct Ctx<'a> {
     section: Section,
 }
 
+/// Advice of the stopped snapshot sent when a second Ctrl+C ends the process.
+const INTERRUPTED: &str = "Stopped: memburn was interrupted";
+
+/// The OS is ending the process.
+fn terminated(why: &str) {
+    upload::abort(why, upload::ABORT_WAIT);
+    // held until the process ends, so the dashboard draws nothing after the restore
+    let out = std::io::stdout().lock();
+    term::restore();
+    std::mem::forget(out);
+}
+
+/// Advice of the stopped snapshot sent when a panic ends the process; panics abort, so the first is the last.
+fn crashed(info: &std::panic::PanicHookInfo) -> String {
+    let p = info.payload();
+    let msg = p.downcast_ref::<&str>().copied().or_else(|| p.downcast_ref::<String>().map(String::as_str));
+    let at = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
+    let text: String = format!("{}{at}", msg.unwrap_or("panic")).chars().take(300).collect();
+    format!("Stopped: memburn crashed: {text}")
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     match run(&args) {
@@ -342,10 +363,17 @@ fn run(args: &Args) -> Result<u8, String> {
     let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
     ctrlc::set_handler(move || {
         if stop.swap(true, Ordering::Relaxed) {
+            upload::abort(INTERRUPTED, upload::ABORT_WAIT);
             std::process::exit(130);
         }
     })
     .map_err(|e| e.to_string())?;
+    os::on_terminate(terminated);
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        hook(info);
+        upload::abort(&crashed(info), upload::ABORT_WAIT);
+    }));
 
     let mut brand = [0u8; 48];
     let brand = cpu::brand(&mut brand).to_string();

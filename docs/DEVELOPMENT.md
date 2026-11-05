@@ -92,7 +92,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-9-5` for 0.9.5 |
+| Volume label | `MB 0-9-6` for 0.9.6 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |
@@ -207,7 +207,9 @@ doubling to 15 s), shows its URL and QR code, and uploads a snapshot every 3 s. 
 panel shows "waiting for network", "connecting" or the error. When the job ends it sends one final snapshot with the verdict and finish time
 (up to 4 tries) and stops; the next job from the result screen gets a new run. The page then shows
 PASS, FAIL or STOPPED and the finish time, and stops polling; a running run silent for 30 s shows
-"No updates since". Runs are kept 30 days.
+"No updates since", and after 2 min without one the server reports it as "Lost contact". A closed console
+window, logoff or shutdown (Windows), SIGTERM or SIGHUP, a second Ctrl+C or a panic sends the latest snapshot
+as STOPPED with the reason as its advice, waiting at most 2.5 s. Runs are kept 30 days.
 
 The live view is a hosted service at reljam.com. `--no-upload` (stick: `upload=0`) turns it off;
 `--server URL` sends to another server that speaks the JSON of `memburn-proto`.

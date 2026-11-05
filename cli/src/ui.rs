@@ -361,6 +361,7 @@ impl Ui {
                 match k {
                     Key::CtrlC if self.stop.load(Ordering::Relaxed) => {
                         self.close_screen();
+                        crate::upload::abort(crate::INTERRUPTED, crate::upload::ABORT_WAIT);
                         std::process::exit(130);
                     }
                     Key::Esc | Key::CtrlC if matches!(self.view.verdict, Verdict::Running | Verdict::Stopping) => {

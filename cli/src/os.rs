@@ -68,6 +68,28 @@ mod imp {
     pub fn free(r: &mut Region) {
         unsafe { VirtualFree(r.ptr as _, 0, MEM_RELEASE) };
     }
+
+    static ON_TERMINATE: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+    /// Ctrl+C and Ctrl+Break return FALSE so that the next handler, ctrlc's, gets them.
+    unsafe extern "system" fn console_event(event: u32) -> windows_sys::core::BOOL {
+        use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+        let why = match event {
+            CTRL_CLOSE_EVENT => "Stopped: the console window was closed",
+            CTRL_LOGOFF_EVENT => "Stopped: the user logged off",
+            CTRL_SHUTDOWN_EVENT => "Stopped: Windows shut down",
+            _ => return 0,
+        };
+        if let Some(f) = ON_TERMINATE.get() {
+            f(why);
+        }
+        1
+    }
+
+    pub fn on_terminate(f: fn(&str)) -> bool {
+        ON_TERMINATE.set(f).is_ok()
+            && unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(console_event), 1) } != 0
+    }
 }
 
 #[cfg(unix)]
@@ -155,6 +177,38 @@ mod imp {
     pub fn smbios() -> Vec<u8> {
         std::fs::read("/sys/firmware/dmi/tables/DMI").unwrap_or_default()
     }
+
+    /// Write end of the pipe that carries a caught signal's number to the [`on_terminate`] thread.
+    static PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    extern "C" fn caught(sig: libc::c_int) {
+        let b = sig as u8;
+        unsafe { libc::write(PIPE.load(std::sync::atomic::Ordering::Relaxed), (&raw const b).cast(), 1) };
+    }
+
+    pub fn on_terminate(f: fn(&str)) -> bool {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+        let read = fds[0];
+        std::thread::spawn(move || {
+            let mut b = 0u8;
+            loop {
+                match unsafe { libc::read(read, (&raw mut b).cast(), 1) } {
+                    1 => break,
+                    -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => return,
+                }
+            }
+            let sig = libc::c_int::from(b);
+            f(if sig == libc::SIGHUP { "Stopped: the terminal was closed" } else { "Stopped: memburn was terminated" });
+            std::process::exit(128 + sig);
+        });
+        let handler = caught as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        [libc::SIGTERM, libc::SIGHUP].into_iter().all(|s| unsafe { libc::signal(s, handler) } != libc::SIG_ERR)
+    }
 }
 
 pub use imp::{alloc, available, can_lock, smbios, total};
@@ -163,6 +217,12 @@ impl Drop for Region {
     fn drop(&mut self) {
         imp::free(self);
     }
+}
+
+/// Calls `f` with the reason when the OS ends the process: console window closed, logoff or shutdown on Windows,
+/// SIGTERM or SIGHUP on Unix. The process ends once `f` returns. False when the handler could not be installed.
+pub fn on_terminate(f: fn(&str)) -> bool {
+    imp::on_terminate(f)
 }
 
 /// Physical address behind `addr` from a `/proc/self/pagemap` entry: bit 63 present, bits 0-54 PFN.

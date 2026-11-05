@@ -254,6 +254,9 @@ pub struct RunView {
     pub updated: u64,
     pub now: u64,
     pub snapshot: Option<Snapshot>,
+    /// Not finished and no update for the server's lost-contact threshold.
+    #[serde(default)]
+    pub lost: bool,
 }
 
 fn tail<T: Clone>(v: &[T], n: usize) -> Vec<T> {

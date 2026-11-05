@@ -96,7 +96,7 @@ impl Drop for Term {
     }
 }
 
-fn restore() {
+pub fn restore() {
     let _ = execute!(io::stdout(), crossterm::style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
 }
