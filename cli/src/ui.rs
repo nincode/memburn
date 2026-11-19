@@ -11,10 +11,14 @@ use memburn_core::history::History;
 use memburn_core::tui::{self, ErrLine, Frame, Places, Qr, Remote, StepState, UpdateLine, UpdateTone, Verdict, View};
 use memburn_proto::Snapshot;
 
+#[cfg(target_os = "linux")]
+use crate::fb as px;
 use crate::os;
 use crate::term::{Key, Term};
 use crate::update::{Next, State, Updater};
 use crate::upload::{Phase, Uploader};
+#[cfg(windows)]
+use crate::win as px;
 
 const DRAW_EVERY: Duration = Duration::from_millis(100);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
@@ -34,9 +38,9 @@ pub enum Tone {
 pub struct Ui {
     pub view: View,
     term: Option<Term>,
-    /// The stick's framebuffers; the text dashboard draws when there are none.
-    #[cfg(target_os = "linux")]
-    pixels: Option<crate::fb::Pixels>,
+    /// The stick's framebuffers or the Windows window; the text dashboard draws when there are none.
+    #[cfg(any(target_os = "linux", windows))]
+    pixels: Option<px::Pixels>,
     ansi: bool,
     tty: bool,
     status_len: usize,
@@ -82,7 +86,7 @@ impl Ui {
         Ui {
             view,
             term,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             pixels: None,
             ansi: os::enable_ansi(),
             tty: std::io::stdout().is_terminal(),
@@ -117,24 +121,58 @@ impl Ui {
     }
 
     pub fn full_screen(&self) -> bool {
-        self.term.is_some()
+        self.term.is_some() || self.has_pixels()
     }
 
-    /// Draws the dashboard as pixels on the framebuffers from now on, when there are any.
+    fn has_pixels(&self) -> bool {
+        #[cfg(any(target_os = "linux", windows))]
+        return self.pixels.is_some();
+        #[cfg(not(any(target_os = "linux", windows)))]
+        false
+    }
+
+    /// Draws the dashboard as pixels from now on: on the stick's framebuffers when there are any, in a window on
+    /// Windows (a console with the text dashboard when it cannot open).
     pub fn pixels(&mut self) {
         #[cfg(target_os = "linux")]
-        if self.term.is_some() {
-            self.pixels = crate::fb::Pixels::open();
+        if self.term.is_none() {
+            return;
+        }
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            self.pixels = px::Pixels::open();
             if let Some(p) = &self.pixels {
                 let s = format!("Display: {}", p.describe());
                 self.line(&s);
             }
         }
+        #[cfg(windows)]
+        if self.pixels.is_none() {
+            crate::win::console();
+            self.term = Term::open().ok();
+        }
     }
 
-    /// Leaves full-screen output: framebuffers first, then the terminal.
+    /// Paints the pixel dashboard; false when there is none.
+    fn draw_pixels(&mut self) -> bool {
+        #[cfg(any(target_os = "linux", windows))]
+        return self.pixels.as_mut().map(|p| p.draw(&self.view)).is_some();
+        #[cfg(not(any(target_os = "linux", windows)))]
+        false
+    }
+
+    /// Next key from the window, else from the terminal.
+    fn key(&self) -> Option<Key> {
+        #[cfg(windows)]
+        if let Some(p) = &self.pixels {
+            return p.key();
+        }
+        self.term.as_ref()?.key(Duration::ZERO)
+    }
+
+    /// Leaves full-screen output: pixels first, then the terminal.
     fn close_screen(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             self.pixels = None;
         }
@@ -188,7 +226,7 @@ impl Ui {
 
     /// Plain mode only: the `\r`-rewritten progress line.
     pub fn status(&mut self, alarm: bool, s: &str) {
-        if self.term.is_some() || !self.tty {
+        if self.full_screen() || !self.tty {
             return;
         }
         self.beat += 1;
@@ -209,7 +247,7 @@ impl Ui {
     }
 
     pub fn styled(&mut self, tone: Tone, s: &str) {
-        if self.term.is_none() {
+        if !self.full_screen() {
             if self.status_len > 0 {
                 print!("\r{:w$}\r", "", w = self.status_len);
                 self.status_len = 0;
@@ -343,21 +381,19 @@ impl Ui {
             self.push();
         }
         let mut other = None;
-        if let Some(term) = &mut self.term {
+        if self.full_screen() {
             if due(self.drawn, DRAW_EVERY) {
                 self.drawn = Some(Instant::now());
-                #[cfg(target_os = "linux")]
-                let drawn = self.pixels.as_mut().map(|p| p.draw(&self.view)).is_some();
-                #[cfg(not(target_os = "linux"))]
-                let drawn = false;
-                if !drawn {
+                if !self.draw_pixels()
+                    && let Some(term) = &mut self.term
+                {
                     let (w, h) = Term::size();
                     let mut f = Frame::new(w, h);
                     tui::render(&self.view, &mut f);
                     term.draw(f);
                 }
             }
-            while let Some(k) = term.key(Duration::ZERO) {
+            while let Some(k) = self.key() {
                 match k {
                     Key::CtrlC if self.stop.load(Ordering::Relaxed) => {
                         self.close_screen();

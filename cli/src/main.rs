@@ -5,6 +5,8 @@ mod term;
 mod ui;
 mod update;
 mod upload;
+#[cfg(windows)]
+mod win;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -80,6 +82,17 @@ struct Args {
     /// Line output instead of the full-screen dashboard
     #[arg(long)]
     plain: bool,
+    /// Pixel dashboard in a window [default: when started without arguments and without a terminal]
+    #[arg(long, conflicts_with_all = ["plain", "no_gui"])]
+    #[cfg_attr(not(windows), arg(hide = true))]
+    gui: bool,
+    /// Text dashboard in the console, also when started without a terminal
+    #[arg(long)]
+    #[cfg_attr(not(windows), arg(hide = true))]
+    no_gui: bool,
+    /// Started elevated by a copy that asked for administrator rights
+    #[arg(long, hide = true)]
+    relaunched: bool,
     /// Do not send progress to the live-view server
     #[arg(long)]
     no_upload: bool,
@@ -223,10 +236,22 @@ fn crashed(info: &std::panic::PanicHookInfo) -> String {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    match run(&args) {
+    #[cfg(windows)]
+    let gui = match win::start(args.gui, args.no_gui || args.plain, std::env::args_os().len() == 1, args.relaunched) {
+        win::Start::Window => true,
+        win::Start::Text => false,
+        win::Start::Relaunched(code) => return ExitCode::from(code),
+    };
+    #[cfg(not(windows))]
+    let gui = false;
+    match run(&args, gui) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("error: {e}");
+            #[cfg(windows)]
+            if gui {
+                win::error(&e);
+            }
             ExitCode::from(2)
         }
     }
@@ -346,7 +371,8 @@ impl Job {
     }
 }
 
-fn run(args: &Args) -> Result<u8, String> {
+/// `gui`: the pixel dashboard in a window instead of the terminal.
+fn run(args: &Args, gui: bool) -> Result<u8, String> {
     let threads = args.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).max(1);
     let tests = parse_tests(args.tests.as_deref())?;
     let sizes = parse_fft(&args.fft)?;
@@ -358,7 +384,7 @@ fn run(args: &Args) -> Result<u8, String> {
     };
     let mem_bytes = parse_mem(&args.mem)?;
     let terminal = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
-    let full_screen = terminal && !args.plain;
+    let full_screen = (terminal && !args.plain) || gui;
 
     let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
     ctrlc::set_handler(move || {
@@ -369,6 +395,10 @@ fn run(args: &Args) -> Result<u8, String> {
     })
     .map_err(|e| e.to_string())?;
     os::on_terminate(terminated);
+    #[cfg(windows)]
+    if !gui {
+        win::watch_session();
+    }
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         hook(info);
@@ -387,13 +417,13 @@ fn run(args: &Args) -> Result<u8, String> {
         braille: os::braille(),
         ..View::default()
     };
-    let mut out = Ui::new(full_screen, view, stop);
+    let mut out = Ui::new(full_screen && !gui, view, stop);
     out.trace = args.trace_rates;
     if let Some(path) = &args.log {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
         out.log = Some(file.map_err(|e| format!("cannot open log {}: {e}", path.display()))?);
     }
-    if args.boot && full_screen {
+    if gui || (args.boot && full_screen) {
         out.pixels();
     }
     out.line(&format!("memburn {}  |  {brand}  |  {threads} threads  |  {}", env!("CARGO_PKG_VERSION"), isa.name()));
@@ -512,7 +542,11 @@ fn run(args: &Args) -> Result<u8, String> {
         };
         first = false;
         countdown = None;
+        #[cfg(windows)]
+        win::CLOSE_CODE.store(3, Ordering::Relaxed);
         code = run_job(&mut c, &j)?;
+        #[cfg(windows)]
+        win::CLOSE_CODE.store(code, Ordering::Relaxed);
         if let Some(n) = start_update(&mut c, Some(&j), false) {
             c.out.close();
             return Ok(n);

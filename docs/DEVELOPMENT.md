@@ -7,7 +7,7 @@ Every front end draws the same full-screen dashboard; networked runs upload to a
 |---|---|
 | `core` | `no_std` tests: memory patterns, parallel phase engine, SSE2/AVX2 FFT kernels, error log, dashboard renderer, run history |
 | `gfx` | `no_std` pixel dashboard on 0x00RRGGBB canvases with Inter and JetBrains Mono (fontdue); changed spans per row |
-| `cli` | `memburn` / `memburn.exe`: terminal dashboard, plain-text mode, uploader |
+| `cli` | `memburn` / `memburn.exe`: terminal dashboard, Windows window, plain-text mode, uploader |
 | `uefi` | `memburn.efi`: bare-metal build that uses every CPU and nearly all RAM; no network |
 | `linux-init` | PID 1 on the stick: loads drivers, starts DHCP, runs `memburn --boot` |
 | `proto` | JSON snapshot shared by the CLI and the server |
@@ -41,8 +41,9 @@ console, conhost, the UEFI text console). A fire burns under the QR code.
 
 The stick's `memburn --boot` and bare-metal UEFI on GOP draw the pixel dashboard from `gfx` instead:
 every 32-bit `/dev/fb*` (console switched to `KD_GRAPHICS`) or every GOP display of at least 640×480,
-painted once per distinct size, only changed spans copied. Without one they keep the cell dashboard; the
-Windows exe and `memburn` in a terminal always do. Snapshot hashes in `gfx/src/tests.rs` change with any
+painted once per distinct size, only changed spans copied. Without one they keep the cell dashboard, as
+`memburn` in a terminal always does. The Windows exe started with a double-click or `--gui` draws it in a window
+at physical pixels (per-monitor DPI aware, `cli/src/win.rs`), never smaller than 640×480. Snapshot hashes in `gfx/src/tests.rs` change with any
 pixel; update them after checking the renders.
 
 About one OVMF boot in 20 (Ubuntu's `OVMF_CODE_4M.fd`, KVM) stalls after console setup and before
@@ -92,7 +93,7 @@ Stress runs only under Linux and Windows (the stick's default entry), not bare-m
 |---|---|
 | Boot | UEFI only; Secure Boot may stay on (Ubuntu's signed shim, GRUB and kernel) |
 | GRUB entries | `memburn <version>` (Linux, network, live view) and `memburn <version> bare-metal UEFI` (Secure Boot off, no network) |
-| Volume label | `MB 0-9-6` for 0.9.6 |
+| Volume label | `MB 0-9-7` for 0.9.7 |
 | Network | Wired Ethernet via DHCP: Intel, Realtek, Broadcom, Aquantia, Atheros and common USB adapters |
 | Config | `memburn.cfg` at the stick's root, keys as in `uefi/memburn.cfg.example`; `server=URL` picks another live-view server |
 | Temperatures | CPU (k10temp, coretemp; bare-metal UEFI reads the same registers directly) and memory modules with a DDR4 JC-42 or DDR5 SPD hub sensor on the chipset SMBus; RAM temp shows only when a sensor answers |
@@ -132,6 +133,7 @@ list U, which checks again.
 | `-d MIN`, `--fft small\|large\|mixed` | burn-in or stress minutes (core cycler: per CPU), FFT sizes |
 | `--isa auto\|sse2\|avx2`, `-t N`, `-c N` | kernel, threads, cycles (0 = forever) |
 | `--plain` | no dashboard; also used when output is not a terminal |
+| `--gui`, `--no-gui` | Windows: the pixel dashboard in a window, or the text dashboard in the console; default is the window when started without arguments and without a terminal (a double-click), which asks for elevation once |
 | `--no-upload`, `--server URL` | live view off, or another server |
 | `--log FILE` | append the run log |
 
@@ -207,8 +209,8 @@ doubling to 15 s), shows its URL and QR code, and uploads a snapshot every 3 s. 
 panel shows "waiting for network", "connecting" or the error. When the job ends it sends one final snapshot with the verdict and finish time
 (up to 4 tries) and stops; the next job from the result screen gets a new run. The page then shows
 PASS, FAIL or STOPPED and the finish time, and stops polling; a running run silent for 30 s shows
-"No updates since", and after 2 min without one the server reports it as "Lost contact". A closed console
-window, logoff or shutdown (Windows), SIGTERM or SIGHUP, a second Ctrl+C or a panic sends the latest snapshot
+"No updates since", and after 2 min without one the server reports it as "Lost contact". A closed console window or
+dashboard window, logoff or shutdown (Windows), SIGTERM or SIGHUP, a second Ctrl+C or a panic sends the latest snapshot
 as STOPPED with the reason as its advice, waiting at most 2.5 s. Runs are kept 30 days.
 
 The live view is a hosted service at reljam.com. `--no-upload` (stick: `upload=0`) turns it off;

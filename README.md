@@ -133,11 +133,11 @@ With a network each run gets a page at `reljam.com/m/<id>`, updated every 3 s. A
 
 ## Windows and Linux programs
 
-The same tests run inside Windows or Linux, with the text dashboard in a terminal. The OS keeps some RAM, so only the stick tests nearly all of it.
+The same tests run inside Windows or Linux: in a window on Windows, the text dashboard in a terminal. The OS keeps some RAM, so only the stick tests nearly all of it.
 
 ![The text dashboard during a failing full memory test: 39 flipped bits in two places, red on the memory map](docs/img/dashboard-fail.webp)
 
-**Windows**: run `memburn-<version>.exe` from an administrator terminal so it can lock test memory.
+**Windows**: double-click `memburn-<version>.exe`. It opens the dashboard in a window and asks for administrator rights to lock test memory. From a terminal it shows the text dashboard; `--gui` opens the window instead.
 
 ```powershell
 .\memburn-<version>.exe                      # menu
